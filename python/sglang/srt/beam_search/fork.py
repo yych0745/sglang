@@ -96,6 +96,13 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
         token_to_kv_pool_allocator.free(_group_held_slots(group, window_slots))
         leader.kv.kv_committed_len = start
         leader.kv.kv_allocated_len = start
+    # A member row owns a mamba slot on a hybrid pool (see
+    # HybridReqToTokenPool.alloc_mamba_for_rows). Release it before the row
+    # itself goes back to free_slots, or the slot leaks for the pool's life
+    # and the pool eventually refuses to admit anything.
+    free_mamba_for_rows = getattr(req_to_token_pool, "free_mamba_for_rows", None)
+    if free_mamba_for_rows is not None:
+        free_mamba_for_rows(group.member_rows)
     req_to_token_pool.free_rows(group.member_rows_cpu.tolist())
     group.member_rows = None
     group.member_rows_cpu = None

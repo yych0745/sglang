@@ -1494,6 +1494,93 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    # ---- beam member-row mamba slot ownership ----------------------------
+    # A beam member row is a bare req_to_token row: alloc_rows() hands it out
+    # with no Req attached, so alloc() never runs for it and its
+    # req_index_to_mamba_index_mapping entry stays 0 -- slot 0, the reserved
+    # padding slot. Every member of a beam would then read and write that one
+    # slot and corrupt each other. These three methods give a member row the
+    # same slot ownership alloc() gives a Req.
+    #
+    # Deliberately NOT folded into alloc_rows(): alloc() routes through it too,
+    # and a mamba slot per row there would double-allocate on top of the one
+    # alloc() itself issues per Req. Non-beam traffic keeps using alloc().
+
+    def alloc_mamba_for_rows(self, rows: torch.Tensor) -> Optional[torch.Tensor]:
+        """Give every row in `rows` its own mamba slot and install it in the
+        row -> slot table. Returns the slots, or None when the allocator cannot
+        cover them.
+
+        All-or-nothing: a short allocator yields None having allocated nothing,
+        never a partial batch and never slot 0. Callers must treat None as a
+        hard failure -- a silent 0 would put several beams on the padding slot.
+        """
+        if self.enable_mamba_extra_buffer:
+            # The ping-pong track buffer's per-row cursor lives on Req.kv
+            # (mamba_next_track_idx / mamba_last_track_idx), which a member row
+            # does not have. Refuse rather than write a half-initialized entry.
+            raise RuntimeError(
+                "Beam member rows cannot own a mamba slot while "
+                "--enable-mamba-extra-buffer is on: the per-row ping-pong "
+                "cursor has nowhere to live. Disable it to run beam search on "
+                "a hybrid model."
+            )
+        need = int(rows.numel())
+        if need == 0:
+            return torch.zeros(
+                0, dtype=self.req_index_to_mamba_index_mapping.dtype, device=self.device
+            )
+        raw = self.mamba_allocator.alloc(need)
+        if raw is None:
+            return None
+        if self.mamba_pool.replayssm_write_pos is not None:
+            # Mirrors alloc(): a freshly issued slot starts with an empty ring.
+            self.mamba_pool.replayssm_write_pos[raw] = 0
+        slots = raw.to(
+            device=self.device, dtype=self.req_index_to_mamba_index_mapping.dtype
+        )
+        self.req_index_to_mamba_index_mapping[rows] = slots
+        return slots
+
+    def free_mamba_for_rows(self, rows: torch.Tensor) -> None:
+        """Hand the slots owned by `rows` back to the allocator and zero their
+        table entries.
+
+        Zeroing matters twice: the row returns to free_slots and can be
+        reissued, and a row that never owned a slot (entry 0) must not reach the
+        allocator -- slot 0 is the reserved padding slot. Idempotent, so a
+        teardown that can run twice cannot double-free.
+        """
+        if int(rows.numel()) == 0:
+            return
+        slots = self.req_index_to_mamba_index_mapping[rows]
+        self.req_index_to_mamba_index_mapping[rows] = 0
+        owned = slots[slots != 0]
+        if owned.numel() == 0:
+            return
+        self.mamba_allocator.free(
+            owned.to(
+                device=self.mamba_allocator.free_slots.device,
+                dtype=self.mamba_allocator.free_slots.dtype,
+            )
+        )
+
+    def replace_mamba_for_rows(self, rows: torch.Tensor) -> Optional[torch.Tensor]:
+        """Fork: give every row in `rows` a fresh slot, returning the slots they
+        owned before.
+
+        The caller owns the returned slots and must release them one tick late
+        (stage_beam_cow_source_slots): the kernel is still reading them this
+        tick, and handing them back now would let the allocator reissue a live
+        slot. Rows that owned nothing are omitted, so slot 0 can never be
+        staged. Returns None, having changed nothing, when the allocator is
+        short.
+        """
+        previous = self.req_index_to_mamba_index_mapping[rows].clone()
+        if self.alloc_mamba_for_rows(rows) is None:
+            return None
+        return previous[previous != 0]
+
     # ---- beam-search copy-on-write double buffer -------------------------
     # See beam_search/mamba_cow.py. A beam prune redirects the pruned rows to
     # read their parent's slot for exactly one forward while writing a fresh

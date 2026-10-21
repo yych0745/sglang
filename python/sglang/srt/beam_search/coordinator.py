@@ -395,6 +395,24 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             [leader.kv.req_pool_idx], dtype=torch.int64, device=device
         )
         group.all_rows = torch.cat([leader_row, member_rows])
+        # Member rows are bare rows: alloc() never ran for them, so on a hybrid
+        # pool their row -> mamba-slot entry is still 0 (the reserved padding
+        # slot) and all k-1 members would read and write it. Own one slot each.
+        alloc_mamba = getattr(self.req_to_token_pool, "alloc_mamba_for_rows", None)
+        if alloc_mamba is not None and alloc_mamba(member_rows) is None:
+            # Hand the req rows back before failing. They are already out of
+            # free_slots at this point, and the admission gate does not yet
+            # reserve mamba slots for members, so this is reachable on a full
+            # pool -- leaking k-1 rows per attempt would wedge the pool.
+            self.req_to_token_pool.free_rows(rows)
+            group.member_rows = None
+            group.member_rows_cpu = None
+            group.all_rows = None
+            raise AssertionError(
+                f"Beam member spawn needs {group.beam_width - 1} mamba slots but "
+                f"only {self.req_to_token_pool.mamba_allocator.available_size()} "
+                f"are free; raise --max-mamba-cache-size or lower beam_width."
+            )
 
     def select_and_relay_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
