@@ -133,6 +133,7 @@ def causal_conv1d_update(
     activation: Optional[str] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
+    src_conv_state_indices: Optional[torch.Tensor] = None,
     pad_slot_id: int = PAD_SLOT_ID,
 ):
     """
@@ -149,6 +150,11 @@ def causal_conv1d_update(
         If not None, the conv_state is a larger tensor along the batch dim,
         and we are selecting the batch coords specified by conv_state_indices.
         Useful for a continuous batching scenario.
+    src_conv_state_indices: (batch,), dtype int32
+        Beam-search copy-on-write: READ the state from these slots, WRITE to
+        conv_state_indices. Only the triton kernel implements the split, so
+        passing it forces the triton path -- the fused CUDA kernel would
+        silently ignore it and read the slot it is about to write.
     pad_slot_id: int
             if cache_indices is passed, lets the kernel identify padded
             entries that will not be processed,
@@ -157,7 +163,7 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
-    use_triton = not _HAS_CONV1D_KERNEL
+    use_triton = not _HAS_CONV1D_KERNEL or src_conv_state_indices is not None
     if use_triton:
         return _causal_conv1d_update_triton(
             x,
@@ -167,6 +173,7 @@ def causal_conv1d_update(
             activation=activation,
             cache_seqlens=cache_seqlens,
             conv_state_indices=conv_state_indices,
+            src_conv_state_indices=src_conv_state_indices,
             pad_slot_id=pad_slot_id,
         )
     if activation not in [None, "silu", "swish"]:
