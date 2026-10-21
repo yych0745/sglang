@@ -48,6 +48,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.beam_search.mamba_cow import BeamMambaCow
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -1382,6 +1383,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
         )
+        # Beam-prune double buffer. Idle (no tensors held) until a prune.
+        self.beam_mamba_cow = BeamMambaCow()
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
@@ -1490,6 +1493,43 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
+
+    # ---- beam-search copy-on-write double buffer -------------------------
+    # See beam_search/mamba_cow.py. A beam prune redirects the pruned rows to
+    # read their parent's slot for exactly one forward while writing a fresh
+    # one, which turns the per-prune state copy into the step's own write.
+
+    def get_beam_cow_read_mapping(
+        self, req_indices: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Source slots for this forward, or None when nothing was pruned (in
+        which case the caller uses get_mamba_indices, i.e. read == write)."""
+        return self.beam_mamba_cow.read_mapping_for(req_indices)
+
+    def set_beam_cow_read_mapping(
+        self, req_pool_indices: torch.Tensor, src_mamba_idx: torch.Tensor
+    ) -> None:
+        self.beam_mamba_cow.set_read_mapping(
+            self.req_index_to_mamba_index_mapping, req_pool_indices, src_mamba_idx
+        )
+
+    def clear_beam_cow_read_mapping(self) -> None:
+        self.beam_mamba_cow.clear_read_mapping()
+
+    def stage_beam_cow_source_slots(self, slots: torch.Tensor) -> None:
+        """Queue the pruned rows' previous slots for release next tick."""
+        self.beam_mamba_cow.stage_source_slots(
+            slots, dtype=self.mamba_allocator.free_slots.dtype
+        )
+
+    def flush_beam_cow_source_slots(self) -> None:
+        """Release last tick's source slots. Must run at the top of a forward,
+        never within the tick that staged them: the kernel is still reading
+        them, and an early release would let the allocator reissue a live slot.
+        """
+        slots = self.beam_mamba_cow.take_source_slots()
+        if slots is not None and slots.numel() > 0:
+            self.mamba_allocator.free(slots)
 
     @property
     def mamba_v2p_table(self) -> Optional[torch.Tensor]:
@@ -1736,6 +1776,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
+        # Slots staged for delayed free are owned by the allocator again after
+        # its clear(); keeping them would double-free on the next flush.
+        self.beam_mamba_cow.reset()
 
 
 @dataclass

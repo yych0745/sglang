@@ -163,6 +163,20 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices
         )
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
+        # Beam-prune double buffer: rows pruned on the previous tick read their
+        # parent's slot while writing the fresh one installed above, so the
+        # state copy rides along with this step's own write. None (the common
+        # case) means read == write. Consumed once: cleared right here, since a
+        # mapping left behind would send the next, non-pruning tick back to a
+        # parent slot whose state is now one step stale.
+        src_mamba_cache_indices = self.req_to_token_pool.get_beam_cow_read_mapping(
+            forward_batch.req_pool_indices
+        )
+        if src_mamba_cache_indices is not None:
+            src_mamba_cache_indices = self._translate_mamba_indices(
+                src_mamba_cache_indices
+            )
+            self.req_to_token_pool.clear_beam_cow_read_mapping()
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
@@ -317,6 +331,7 @@ class MambaAttnBackendBase(AttentionBackend):
             logical_num_tokens=logical_num_tokens,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
+            src_mamba_cache_indices=src_mamba_cache_indices,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),

@@ -31,6 +31,12 @@ class ForwardMetadata:
     mamba_cache_indices: torch.Tensor
     logical_num_tokens: Optional[int] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    # Beam-search COW double buffer: slots to READ this forward, when they
+    # differ from mamba_cache_indices (the WRITE targets). Set only on the tick
+    # right after a beam prune, where the pruned rows must read their parent's
+    # state while writing freshly allocated slots -- that is what makes the
+    # prune copy-free. None everywhere else, meaning read == write.
+    src_mamba_cache_indices: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
     # in-place each replay), eager sets the translated decode tensor. The decode
