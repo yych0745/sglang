@@ -93,6 +93,16 @@ class BeamMambaCow:
         """Drop the mapping after one forward has consumed it."""
         self._read_mapping = None
 
+    def read_mapping_pending(self) -> bool:
+        """Whether a prune's mapping is still unconsumed.
+
+        The graph paths ask this before building replay metadata: they have no
+        slot for the mapping, so a pending one reaching them means the prune's
+        copy-on-write would be dropped and the rows would silently decode from
+        the wrong state. Failing there beats replaying wrong.
+        """
+        return self._read_mapping is not None
+
     # ---- free side -------------------------------------------------------
 
     def stage_source_slots(

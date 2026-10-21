@@ -531,6 +531,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
 
+    # Beam member rows riding this forward (0 when reqs and rows are 1:1). The
+    # decode cuda graph refuses a batch that carries them: the captured / replayed
+    # mamba metadata has no slot for the beam prune's copy-on-write read
+    # mapping, so replaying one would drop the COW silently.
+    beam_num_tail_rows: int = 0
+
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
@@ -991,6 +997,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
+            beam_num_tail_rows=(
+                len(batch.seq_lens) - batch.beam_tail.num_base_rows
+                if getattr(batch, "beam_tail", None) is not None
+                else 0
+            ),
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,

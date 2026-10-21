@@ -169,14 +169,23 @@ class MambaAttnBackendBase(AttentionBackend):
         # case) means read == write. Consumed once: cleared right here, since a
         # mapping left behind would send the next, non-pruning tick back to a
         # parent slot whose state is now one step stale.
-        src_mamba_cache_indices = self.req_to_token_pool.get_beam_cow_read_mapping(
-            forward_batch.req_pool_indices
-        )
-        if src_mamba_cache_indices is not None:
-            src_mamba_cache_indices = self._translate_mamba_indices(
-                src_mamba_cache_indices
+        #
+        # Decode-only on purpose. The mapping is armed by the beam relay, which
+        # runs after a decode forward, and is meant for that group's next
+        # decode; consuming it in an unrelated prefill would (a) point the
+        # prefill's own rows at the snapshot for no reason and (b) clear it, so
+        # the beam rows would later read the fresh slots they were given at
+        # prune time, which nobody has written yet.
+        src_mamba_cache_indices = None
+        if forward_batch.forward_mode.is_decode():
+            src_mamba_cache_indices = self.req_to_token_pool.get_beam_cow_read_mapping(
+                forward_batch.req_pool_indices
             )
-            self.req_to_token_pool.clear_beam_cow_read_mapping()
+            if src_mamba_cache_indices is not None:
+                src_mamba_cache_indices = self._translate_mamba_indices(
+                    src_mamba_cache_indices
+                )
+                self.req_to_token_pool.clear_beam_cow_read_mapping()
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
@@ -669,6 +678,29 @@ class MambaAttnBackendBase(AttentionBackend):
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
 
+    def _assert_no_beam_cow_for_graph(self, forward_mode: ForwardMode) -> None:
+        """Refuse a graph path that cannot carry the beam COW read mapping.
+
+        Neither _capture_metadata nor _replay_metadata passes
+        src_mamba_cache_indices, so a beam prune's mapping reaching either one
+        would be dropped and the pruned rows would read the fresh slots they
+        were handed at prune time -- state nobody has written yet. The decode
+        cuda graph is gated off for beam batches (can_run_graph refuses a batch
+        carrying beam rows), so this only ever fires if that gate is bypassed.
+        Loud, because the alternative is silently wrong output.
+        """
+        if not forward_mode.is_decode():
+            return
+        pool = self.req_to_token_pool
+        pending = getattr(pool, "beam_cow_read_mapping_pending", None)
+        if pending is not None and pending():
+            raise RuntimeError(
+                "A beam-prune mamba copy-on-write read mapping reached the cuda "
+                "graph metadata path, which cannot carry it; replaying would "
+                "drop the copy-on-write and decode from unwritten state. This "
+                "means the beam batch bypassed the decode cuda graph gate."
+            )
+
     def _capture_metadata(
         self,
         bs: int,
@@ -676,6 +708,7 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        self._assert_no_beam_cow_for_graph(forward_mode)
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
@@ -742,6 +775,7 @@ class MambaAttnBackendBase(AttentionBackend):
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
     ):
+        self._assert_no_beam_cow_for_graph(forward_mode)
         if num_padding is None:
             if seq_lens_cpu is None:
                 num_padding = 0

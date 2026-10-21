@@ -2517,6 +2517,9 @@ class Scheduler(
             tree_cache=self.tree_cache,
             future_map=self.future_map,
             trie=self._load_beam_trie(),
+            enable_beam_mamba_double_buffer=getattr(
+                self.server_args, "enable_beam_mamba_double_buffer", False
+            ),
         )
 
     def _load_beam_trie(self):

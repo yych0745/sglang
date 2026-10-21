@@ -1603,6 +1603,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def clear_beam_cow_read_mapping(self) -> None:
         self.beam_mamba_cow.clear_read_mapping()
 
+    def beam_cow_read_mapping_pending(self) -> bool:
+        """Whether a prune's read mapping is still waiting to be consumed.
+
+        The graph paths query this to fail loudly: they cannot carry the
+        mapping, so reaching one with a mapping pending means the prune's COW
+        would be dropped and the beam rows would decode from the wrong state.
+        """
+        return self.beam_mamba_cow.read_mapping_pending()
+
     def stage_beam_cow_source_slots(self, slots: torch.Tensor) -> None:
         """Queue the pruned rows' previous slots for release next tick."""
         self.beam_mamba_cow.stage_source_slots(

@@ -134,6 +134,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     # Constrained decoding: compiled once at scheduler init from
     # --beam-trie-path, shared by every group (read-only CSR tensors).
     trie: Optional[BeamTrie] = None
+    # --enable-beam-mamba-double-buffer. Beam search on a mamba/hybrid cache is
+    # refused without it: a prune cannot reparent SSM state through
+    # req_to_token, so it needs the per-row copy-on-write double buffer that
+    # this switch is the opt-in for.
+    enable_beam_mamba_double_buffer: bool = False
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
@@ -169,8 +174,19 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search is not supported with hierarchical cache."
         if self.model_config.is_encoder_decoder:
             return "Beam search is not supported with encoder-decoder models."
-        if self.tree_cache.supports_swa() or self.tree_cache.supports_mamba():
-            return "Beam search is not supported with SWA/mamba hybrid caches."
+        if self.tree_cache.supports_swa():
+            # SWA: no reparenting story at all -- a window is a sliding range of
+            # token slots, and the beam's reparent rewrites req_to_token in
+            # place, so a survivor would silently lose the window it inherited.
+            return "Beam search is not supported with SWA hybrid caches."
+        if self.tree_cache.supports_mamba() and not self.enable_beam_mamba_double_buffer:
+            return (
+                "Beam search is not supported with mamba hybrid caches unless "
+                "--enable-beam-mamba-double-buffer is set: a beam prune cannot "
+                "reparent SSM state by rewriting req_to_token the way it "
+                "reparents attention KV, so each pruned row has to read its "
+                "parent's slot while writing a freshly allocated one."
+            )
 
         if req.session_id is not None or recv_req.session_params is not None:
             return "Beam search is not supported for session requests."
@@ -297,6 +313,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     ) -> None:
         """Per-forward relay hook: overwrite beam rows' relayed tokens with
         joint-selected ones. O(1) when no beam group is live."""
+        # Runs before the early returns on purpose: the slots a group staged
+        # still have to be released even when that group has since left the
+        # live set, or the last prune of a finished group leaks them.
+        self._flush_beam_cow_source_slots()
         if self._num_live_groups == 0:
             return
         if not batch.spec_algorithm.is_none():
@@ -332,6 +352,23 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 self.select_leader_prefill(
                     req, leader_pos[i], logits_output, tick=batch.forward_iter
                 )
+
+    def _flush_beam_cow_source_slots(self) -> None:
+        """Hand last relay's detached mamba slots back to the allocator.
+
+        Mounted here, at the top of the per-forward relay hook, rather than at
+        the top of a forward: the slots staged by relay N are read by forward
+        N+1 (they are the parents' old slots, and the rows now write fresh
+        ones), so they may only be released once that forward has been
+        launched -- which is exactly the point this hook runs at. Releasing
+        them at the top of forward N+1 instead would put them back in the free
+        list while the kernel is still about to read them.
+
+        One call per forward, and a no-op on a pool without the double buffer.
+        """
+        flush = getattr(self.req_to_token_pool, "flush_beam_cow_source_slots", None)
+        if flush is not None:
+            flush()
 
     def select_leader_prefill(
         self,
@@ -528,10 +565,70 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 seq_len=group.leader.kv.kv_committed_len,
             )
             group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
+            # SSM state rides the same reparenting: every row whose KV now
+            # points at its parent's window must also decode from its parent's
+            # recurrent state, or the two histories disagree from here on.
+            self._apply_mamba_cow(rows, parent_idx)
             # Length placeholder only; the DAG owns history and member rows
             # have no host state.
             group.leader.output_ids.append(0)
         self._stash_next_tokens(rows, next_tokens)
+
+    def _apply_mamba_cow(self, rows: torch.Tensor, parent_idx: torch.Tensor) -> None:
+        """Write side of the mamba double buffer for one group's prune.
+
+        Attention KV is reparented by the `remap_kv_mapping` call above; SSM
+        state cannot be, so each row instead reads its parent's slot for this
+        one forward while writing a slot of its own. That read-then-write *is*
+        the state copy, fused into the step that was going to write anyway.
+
+        The three steps are order-critical and pure device work (no D2H):
+
+          1. source slots = the parent rows' slots as they are right now;
+          2. `set_beam_cow_read_mapping`, which snapshots the live table --
+             it must run BEFORE step 3, or the snapshot would name the fresh
+             slots and every row would read the slot it is about to write;
+          3. `replace_mamba_for_rows`, which installs the fresh slots, and the
+             detached old ones are staged to go back one tick late (the kernel
+             is still reading them this forward).
+
+        No-op on a pool without the mamba double buffer (a non-hybrid pool).
+        """
+        pool = self.req_to_token_pool
+        replace = getattr(pool, "replace_mamba_for_rows", None)
+        if replace is None:
+            return
+        need = int(rows.numel())
+        if need == 0:
+            return
+        # Check before touching anything: a short allocator must not leave a
+        # half-installed read mapping behind. len() reads a shape, not data, so
+        # this stays off the sync path.
+        if pool.mamba_allocator.available_size() < need:
+            raise RuntimeError(
+                f"Beam prune needs {need} fresh mamba slots for the copy-on-write "
+                f"double buffer but only {pool.mamba_allocator.available_size()} "
+                f"are free; raise --max-mamba-cache-size / "
+                f"--mamba-full-memory-ratio, lower beam_width, or disable "
+                f"--enable-beam-mamba-double-buffer."
+            )
+        # `parent_idx` is in `rows` order (the same index space remap_kv_mapping
+        # uses), so the parent's slot is the row's own table entry gathered at
+        # the parent's position -- read before step 3 overwrites any of them.
+        src_slots = pool.req_index_to_mamba_index_mapping[rows][parent_idx]
+        pool.set_beam_cow_read_mapping(rows, src_slots)
+        previous = replace(rows)
+        if previous is None:
+            # Unreachable after the availability check above, but a silent None
+            # here would leave the rows reading their parents' slots with no
+            # fresh write target -- a self-read/write aliasing corruption.
+            raise RuntimeError(
+                f"Beam prune could not allocate {need} fresh mamba slots for the "
+                f"copy-on-write double buffer; raise --max-mamba-cache-size or "
+                f"lower beam_width."
+            )
+        if previous.numel():
+            pool.stage_beam_cow_source_slots(previous)
 
     def _reclaim_orphans(
         self, group: BeamGroup, up_to_tick: Optional[int] = None

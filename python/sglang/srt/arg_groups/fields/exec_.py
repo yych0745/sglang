@@ -191,6 +191,18 @@ class ExecKernel(msgspec.Struct):
             "leaves beam search unconstrained.",
         ),
     ] = None
+    enable_beam_mamba_double_buffer: A[
+        bool,
+        Arg(
+            help="Allow beam search on mamba / hybrid-linear-attention caches. "
+            "Off by default because a beam prune cannot reparent SSM state by "
+            "rewriting req_to_token the way it reparents attention KV: each "
+            "pruned row instead reads its parent's slot while writing a freshly "
+            "allocated one (copy-on-write double buffer), which costs one extra "
+            "mamba slot per beam row per prune. Beam search is rejected on a "
+            "mamba cache unless this is set.",
+        ),
+    ] = False
     fp8_gemm_runner_backend: A[
         str,
         Arg(

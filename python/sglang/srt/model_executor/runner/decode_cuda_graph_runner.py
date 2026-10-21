@@ -674,6 +674,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # Beam member rows ride the decode batch as extra rows. The captured /
+        # replayed mamba metadata (_capture_metadata / _replay_metadata) carries
+        # no src_mamba_cache_indices, so a beam prune's copy-on-write read
+        # mapping would be dropped by a replay and the rows would silently
+        # decode from the wrong state. Refuse rather than replay wrong; the
+        # hybrid backend additionally raises if a mapping ever reaches a replay.
+        if getattr(forward_batch, "beam_num_tail_rows", 0):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
