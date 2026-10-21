@@ -656,6 +656,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        # Beam-prune COW double buffer: slots to READ this forward, when they
+        # differ from mamba_cache_indices (the WRITE targets). Set only on the
+        # tick right after a beam prune, where a re-parented row must continue
+        # from its parent's state while writing a freshly allocated slot -- that
+        # is what makes the prune copy-free. None everywhere else, meaning
+        # read == write.
+        src_cache_indices = self.forward_metadata.src_mamba_cache_indices
+        if src_cache_indices is not None and (is_npu() or is_cpu()):
+            # The platform causal_conv1d_update ops bound at import time have no
+            # way to read a slot other than the one they write, and neither does
+            # the non-packed decode path they fall through to. Failing loudly
+            # beats silently reading the slot about to be overwritten.
+            raise NotImplementedError(
+                "beam-search COW (src_mamba_cache_indices) requires the "
+                "read/write slot split, which the NPU/CPU GDN decode kernels "
+                "do not implement. Run beam search on CUDA."
+            )
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
         # per-row write cursor. All None unless --enable-linear-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
@@ -692,6 +709,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             )
             if eligible:
+                if src_cache_indices is not None:
+                    # The fused QKVZ/BA unpack performs the conv state update
+                    # in place on conv_states[cache_indices]; it has nowhere to
+                    # express "read another slot". Honouring COW here would
+                    # silently read the slot it is about to overwrite.
+                    raise NotImplementedError(
+                        "beam-search COW (src_mamba_cache_indices) is not "
+                        "supported by the fused GDN decode QKVZ/BA projection + "
+                        "Conv1D path, which reads and writes the same conv slot. "
+                        "Disable that fusion to run beam search."
+                    )
                 qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
                 fused_backend = "triton_direct_oracle_exact"
                 if not _fused_decode_proj_conv_logged:
@@ -824,6 +852,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.bias,
                 layer.activation,
                 conv_state_indices=cache_indices,
+                # None => read == write (byte-identical to the pre-COW call).
+                src_conv_state_indices=src_cache_indices,
             )
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -840,6 +870,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
+                # Beam COW read slots; None => read == write. The ReplaySSM ring
+                # branch inside the kernel rejects a non-None src itself.
+                src_cache_indices=src_cache_indices,
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,
@@ -862,6 +895,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
+        if src_cache_indices is not None:
+            # Only TritonGDNKernel.packed_decode takes src_cache_indices; the
+            # split-QKV decode kernel (and every non-triton decode kernel)
+            # writes the slot it reads, so a COW mapping would be dropped and
+            # the row would resume from the slot it is overwriting.
+            raise NotImplementedError(
+                "beam-search COW (src_mamba_cache_indices) is only supported by "
+                "the packed GDN decode kernel; this decode path does not "
+                "support beam COW."
+            )
         core_attn_out = self.kernel_dispatcher.decode(
             q=query,
             k=key,
