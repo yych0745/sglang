@@ -54,6 +54,7 @@ from sglang.srt.beam_search.fork import (
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.trie import BeamTrie
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import (
@@ -81,10 +82,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
+def _rows_topk_logprobs(
+    pieces: Sequence[torch.Tensor],
+    num_candidates: int,
+    mask: Optional[torch.Tensor] = None,
+):
+    """Top-`num_candidates` log-probs per row, over the concatenated pieces.
+
+    `mask` (True = forbidden) is given in concatenated row order, i.e. aligned
+    with `torch.cat(pieces)`; empty pieces contribute no rows, so they must not
+    advance the row cursor.
+    """
     # One logsumexp per piece: it is not batch-invariant on CUDA, and folding
     # pieces shifts the leader's lse by an ulp, flipping near-equal beams.
     vals, toks = [], []
+    row = 0
     for piece in pieces:
         if piece.shape[0] == 0:
             continue
@@ -92,9 +104,21 @@ def _rows_topk_logprobs(pieces: Sequence[torch.Tensor], num_candidates: int):
         # lse instead of a full [rows, vocab] log_softmax; topk order on raw
         # logits is identical under the monotone shift.
         lse = torch.logsumexp(x, dim=-1, keepdim=True)
+        if mask is not None:
+            # Mask AFTER the lse so the normalizer stays the model's own
+            # distribution: scores remain comparable across steps and across
+            # constrained/unconstrained groups. Masking first would renormalize
+            # over the allowed set and inflate every surviving candidate.
+            piece_mask = mask[row : row + piece.shape[0]]
+            assert piece_mask.shape[0] == piece.shape[0], (
+                f"trie mask has {mask.shape[0]} rows but the pieces carry "
+                f"more: row offset {row} + piece rows {piece.shape[0]}"
+            )
+            x = x.masked_fill(piece_mask, float("-inf"))
         v, t = torch.topk(x, num_candidates, dim=-1)
         vals.append(v - lse)
         toks.append(t)
+        row += piece.shape[0]
     return torch.cat(vals), torch.cat(toks)
 
 
@@ -107,6 +131,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     future_map: FutureMap
+    # Constrained decoding: compiled once at scheduler init from
+    # --beam-trie-path, shared by every group (read-only CSR tensors).
+    trie: Optional[BeamTrie] = None
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
@@ -197,14 +224,30 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"context budget (prompt_len={prompt_len}, max_req_len={self.max_req_len})."
             )
 
+        if self.trie is not None:
+            # A constrained request must be able to walk the trie to a leaf and
+            # then emit the terminator: anything shorter can only ever return
+            # truncated paths, which are not dictionary entries. Rejecting here
+            # keeps the failure at admission instead of silently degrading.
+            needed = self.trie.depth + 1
+            if max_new_tokens < needed:
+                return (
+                    f"Trie-constrained beam search needs max_new_tokens >= "
+                    f"{needed} (trie depth {self.trie.depth} + a terminator "
+                    f"step), but the effective budget is {max_new_tokens}."
+                )
+
         group = BeamGroup(
             beam_width=beam_width,
             stop_token_ids=self._collect_stop_token_ids(req, user_params),
             max_new_tokens=max_new_tokens,
             num_return=user_params.n,
+            length_penalty=user_params.length_penalty,
+            early_stopping=user_params.early_stopping,
             # Frontier state lives on device: selection consumes device top-2k
             # tensors in place; only k-sized results ever reach the host.
             device=self.req_to_token_pool.device,
+            trie=self.trie,
         )
         group.leader = req
         group.prompt_len = prompt_len
@@ -301,7 +344,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
         top_logprobs, top_tokens = _rows_topk_logprobs(
-            [logits_output.beam.leader_logits[pos : pos + 1]], group.num_candidates
+            [logits_output.beam.leader_logits[pos : pos + 1]],
+            group.num_candidates,
+            # One leader row: its cursor is the whole mask. Built before
+            # _select_group, which advances the cursor for the next tick.
+            self._trie_mask(group),
         )
         final = group.next_step_is_final()
         next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
@@ -368,6 +415,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                     capture.tail_logits[entry.start : entry.end],
                 ],
                 group.num_candidates,
+                # Row order matches pieces: leader first, then member rows in
+                # frontier order -- the same [k, ...] layout as trie_cursor.
+                self._trie_mask(group),
             )
             next_tokens, parent_idx = self._select_group(
                 group, top_logprobs, top_tokens, batch.forward_iter
@@ -397,6 +447,21 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 self._finish_group(group)
                 newly_finished.add(id(group))
         return newly_finished
+
+    def _trie_mask(self, group: BeamGroup) -> Optional[torch.Tensor]:
+        """[rows, vocab] forbidden-mask for this group's current cursors, or
+        None when the group is unconstrained.
+
+        Pure device work, so it stays legal before the launch-half selection.
+        Callers MUST build it before _select_group, which advances the cursor:
+        the mask describes the frontier this selection expands, not the next.
+        Vocab is implied by the trie's own bounds; the select path checks the
+        row count separately, so a mismatched group fails loudly instead of
+        silently masking the wrong rows.
+        """
+        if group.trie is None or group.trie_cursor is None:
+            return None
+        return group.trie.build_mask(group.trie_cursor, self.model_config.vocab_size)
 
     def _select_group(
         self,
@@ -458,8 +523,16 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if not group.pending_orphans:
             return
         if up_to_tick is None:
-            # Teardown drains every staged tick.
-            staged, group.pending_orphans = group.pending_orphans, []
+            # Teardown. Only records the commit half actually validated may be
+            # drained here: a launch-half write-back from an uncommitted tick
+            # has its old_mapping slots still reachable from the live rows, and
+            # free_member_rows is what owns those. Draining them blindly would
+            # double-free. Records past last_committed_tick are left to
+            # free_member_rows' live-window reclaim.
+            staged = [
+                e for e in group.pending_orphans if e.tick <= group.last_committed_tick
+            ]
+            group.pending_orphans = []
         else:
             staged = [e for e in group.pending_orphans if e.tick <= up_to_tick]
             group.pending_orphans = [
@@ -508,10 +581,14 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         self._retire_group(group)
 
     def _free_member_rows(self, group: BeamGroup) -> None:
-        # Staged orphans are unreachable from every row, so the group-wide
-        # dedup free below would miss them.
-        self._reclaim_orphans(group)
+        # Order matters: free_member_rows reclaims slots that only the staged
+        # orphan records can still name (a write-back whose old_mapping is no
+        # longer reachable from any live row), so it must run while the queue
+        # is intact. _reclaim_orphans afterwards drains whatever is left --
+        # its teardown branch clears the queue unconditionally, which would
+        # otherwise hide those records from the reclaim logic entirely.
         free_member_rows(group, self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        self._reclaim_orphans(group)
 
     def _retire_group(self, group: BeamGroup) -> None:
         # Exactly once per group, so the O(1) live gate stays accurate.

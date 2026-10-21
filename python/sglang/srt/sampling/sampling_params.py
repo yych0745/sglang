@@ -140,6 +140,15 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     # beam_width > 1 turns the request into a beam search request; n then means
     # "number of returned sequences" rather than parallel samples (n <= beam_width).
     beam_width: Optional[int] = None
+    # Length penalty applied when scoring finished beams:
+    # score = cum_logprob / num_tokens ** length_penalty.
+    # 1.0 = standard length normalization, < 1.0 favors shorter sequences,
+    # > 1.0 favors longer ones. Only affects beam search requests.
+    length_penalty: float = 1.0
+    # Early stopping for beam search: stop once enough finished beams are
+    # collected (>= beam_width) or no live beams remain, instead of always
+    # running to max_new_tokens. Only affects beam search requests.
+    early_stopping: bool = True
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
@@ -194,6 +203,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.min_new_tokens if self.min_new_tokens is not None else 0
         )
         self.n = self.n if self.n is not None else 1
+        self.length_penalty = (
+            self.length_penalty if self.length_penalty is not None else 1.0
+        )
+        self.early_stopping = (
+            self.early_stopping if self.early_stopping is not None else True
+        )
         self.ignore_eos = self.ignore_eos if self.ignore_eos is not None else False
         self.skip_special_tokens = (
             self.skip_special_tokens if self.skip_special_tokens is not None else True
@@ -224,6 +239,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     def verify(self, vocab_size):
         if self.beam_width is not None and self.beam_width < 1:
             raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
+        if not math.isfinite(self.length_penalty):
+            raise ValueError(
+                f"length_penalty must be a finite number, got {self.length_penalty}."
+            )
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."

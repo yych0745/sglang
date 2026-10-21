@@ -166,6 +166,23 @@ pub struct SamplingParams {
     /// positional wire layout even though the rust path rejects it below.
     #[serde(default)]
     pub beam_width: Option<i64>,
+    /// Beam search scoring exponent: `cum_logprob / num_tokens ** length_penalty`.
+    /// Mirrored for the positional wire layout even though the rust path rejects
+    /// beam search below.
+    #[serde(
+        default = "f64_one::default",
+        deserialize_with = "f64_one::deserialize"
+    )]
+    pub length_penalty: f64,
+    /// Beam search early stopping: stop once the completed pool reaches
+    /// `beam_width` (or no live beams remain) instead of running to
+    /// `max_new_tokens`. Mirrored for the positional wire layout even though the
+    /// rust path rejects beam search below.
+    #[serde(
+        default = "bool_true::default",
+        deserialize_with = "bool_true::deserialize"
+    )]
+    pub early_stopping: bool,
 
     // Structured-output constraints.
     #[serde(default)]
@@ -369,6 +386,8 @@ impl Default for SamplingParams {
             min_new_tokens: i64_zero::default(),
             n: i64_one::default(),
             beam_width: None,
+            length_penalty: f64_one::default(),
+            early_stopping: bool_true::default(),
             json_schema: None,
             regex: None,
             ebnf: None,
@@ -795,7 +814,7 @@ mod tests {
         assert_eq!(sp.min_new_tokens, 4096);
     }
 
-    /// The 31 wire slots, in Python's declaration order.
+    /// The 34 wire slots, in Python's declaration order.
     ///
     /// `SamplingParams` is `msgspec.Struct(array_like=True)` on the Python side, so
     /// the header carries an ARRAY and every field is identified by POSITION. Two
@@ -821,6 +840,8 @@ mod tests {
         "min_new_tokens",
         "n",
         "beam_width",
+        "length_penalty",
+        "early_stopping",
         "json_schema",
         "regex",
         "ebnf",
@@ -863,6 +884,8 @@ mod tests {
             min_new_tokens: 20,
             n: 1,
             beam_width: Some(21),
+            length_penalty: 21.5,
+            early_stopping: false,
             json_schema: Some("22".into()),
             regex: Some("23".into()),
             ebnf: Some("24".into()),
@@ -899,6 +922,8 @@ mod tests {
         assert_eq!(arr[at("presence_penalty")].as_f64(), Some(0.18));
         assert_eq!(arr[at("repetition_penalty")].as_f64(), Some(0.19));
         assert_eq!(arr[at("beam_width")].as_i64(), Some(21));
+        assert_eq!(arr[at("length_penalty")].as_f64(), Some(21.5));
+        assert_eq!(arr[at("early_stopping")].as_bool(), Some(false));
         assert_eq!(arr[at("json_schema")].as_str(), Some("22"));
         assert_eq!(arr[at("regex")].as_str(), Some("23"));
         assert_eq!(arr[at("ebnf")].as_str(), Some("24"));

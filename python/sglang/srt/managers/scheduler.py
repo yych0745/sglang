@@ -15,6 +15,7 @@
 
 import dataclasses
 import faulthandler
+import hashlib
 import logging
 import math
 import os
@@ -68,6 +69,7 @@ try:
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.beam_search.trie import load_or_compile as load_or_compile_beam_trie
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -378,6 +380,35 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tokenizer_fingerprint(tokenizer) -> str:
+    """Identity of the vocabulary the trie's token ids belong to.
+
+    The compiled-trie cache is keyed on this, because the same dictionary file
+    read through a different tokenizer yields different -- and silently wrong --
+    token ids. Size plus a hash of the id->token mapping is enough to separate
+    two vocabularies and cheap enough to compute once at startup.
+    """
+    size = getattr(tokenizer, "vocab_size", None) or len(tokenizer)
+    digest = hashlib.sha1()
+    # Fast path: the raw id->token dict most HF tokenizers carry. It is the same
+    # information as the per-id round trip below, without 90k python calls.
+    vocab = getattr(tokenizer, "get_vocab", None)
+    table = None
+    if callable(vocab):
+        try:
+            table = vocab()
+        except Exception:
+            table = None
+    if table:
+        for token in sorted(table):
+            digest.update(f"{token}\x00{table[token]}\x00".encode())
+    else:
+        for token_id in range(size):
+            digest.update(str(tokenizer.convert_ids_to_tokens(token_id)).encode())
+            digest.update(b"\x00")
+    return f"v{size}:{digest.hexdigest()[:16]}"
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -2485,7 +2516,70 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             future_map=self.future_map,
+            trie=self._load_beam_trie(),
         )
+
+    def _load_beam_trie(self):
+        """Compile the configured SID dictionary, or None when unconstrained.
+
+        Fail-fast on purpose: a half-loaded constraint would silently return
+        unconstrained beams, which is far worse for a caller than a startup
+        error.
+        """
+        trie_path = getattr(self.server_args, "beam_trie_path", None)
+        if not trie_path:
+            return None
+
+        tokenizer = self.tokenizer
+        if tokenizer is None:
+            raise ValueError(
+                f"--beam-trie-path {trie_path} needs a tokenizer to map "
+                f"dictionary fragments to token ids, but none was loaded."
+            )
+
+        # The dictionary is written in <a_N>/<b_N>/<c_N> fragments, each of
+        # which must be exactly ONE token; anything else means the dictionary
+        # and the tokenizer do not belong together.
+        #
+        # Resolved through the raw vocab table rather than
+        # convert_tokens_to_ids(): that API returns None (not the unk id) for
+        # unknown input on several tokenizer backends, and it also re-parses
+        # the fragment instead of looking it up, so a fragment that happens to
+        # split into two tokens would silently be accepted as one id.
+        vocab = tokenizer.get_vocab()
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+
+        def token_to_id(fragment: str):
+            token_id = vocab.get(fragment)
+            if token_id is None:
+                return None
+            if token_id == unk_token_id:
+                return None
+            return int(token_id)
+
+        eos_token_id = self.model_config.hf_config.eos_token_id
+        if not isinstance(eos_token_id, int):
+            raise ValueError(
+                f"--beam-trie-path {trie_path} needs a single EOS token id, "
+                f"got {eos_token_id!r}."
+            )
+
+        logger.info("compiling beam trie from %s", trie_path)
+        trie = load_or_compile_beam_trie(
+            trie_path,
+            device=self.req_to_token_pool.device,
+            eos_token_id=eos_token_id,
+            token_to_id=token_to_id,
+            tokenizer_fingerprint=_tokenizer_fingerprint(tokenizer),
+        )
+        logger.info(
+            "beam trie ready: %d nodes, %d edges, depth %d, eos %d",
+            trie.num_nodes,
+            trie.num_edges,
+            trie.depth,
+            trie.eos_token_id,
+        )
+        return trie
 
     def init_batch_result_processor(self) -> None:
         self.init_beam_coordinator()

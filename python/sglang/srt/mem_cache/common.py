@@ -170,7 +170,15 @@ def free_kv_row_segments(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if req.skip_radix_cache_insert:
+    # `skip_radix_cache_insert` means "do not publish this req's KV as a
+    # shareable tree entry" (beam paths are per-candidate, never reusable).
+    # ChunkCache has no tree to publish into: its `cache_unfinished_req` only
+    # advances `req.prefix_indices`, which is what `add_chunked_req` reads to
+    # know how much of the prompt is already filled. Skipping it there leaves
+    # the cursor at zero, so a chunked prefill re-fills the same chunk forever
+    # and never releases the KV it took -- the pool is drained until prefill
+    # OOMs. Only the real prefix caches are allowed to honour the flag.
+    if req.skip_radix_cache_insert and not tree_cache.is_chunk_cache():
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

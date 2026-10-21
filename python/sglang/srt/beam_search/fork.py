@@ -92,13 +92,61 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
         # The rewind below is required: without it the leader's own per-Req
         # release frees this decode region a second time.
         slots = req_to_token_pool.req_to_token[group.all_rows, start:end]
-        token_to_kv_pool_allocator.free(slots.flatten().unique())
+        window_slots = slots.flatten().unique()
+        token_to_kv_pool_allocator.free(_group_held_slots(group, window_slots))
         leader.kv.kv_committed_len = start
         leader.kv.kv_allocated_len = start
     req_to_token_pool.free_rows(group.member_rows_cpu.tolist())
     group.member_rows = None
     group.member_rows_cpu = None
     group.all_rows = None
+
+
+def _group_held_slots(group, window_slots: torch.Tensor) -> torch.Tensor:
+    """Every slot the group still holds in its decode region: the ones its rows
+    name right now, plus the ones a dropped tick stranded.
+
+    A staged remap is written back to req_to_token by the launch half before the
+    commit half decides the tick's fate. When the group finishes mid-remap --
+    early_stopping does exactly this -- the commit half discards that tick, and
+    _reclaim_orphans correctly refuses to act on its unvalidated mapping pair.
+    But the write-back already happened: the rows now name their parents' slots,
+    so the slots the remap displaced are referenced by nobody and the window
+    scan above cannot see them. They would be stranded for the pool's lifetime,
+    which shows up as `available` sitting below `total` by one group's worth of
+    displaced slots after every finished group.
+
+    A staged record is only acted on if it demonstrably describes the state
+    req_to_token is in right now: every slot of its new_mapping must be present
+    in the live window. That holds exactly when this record's write-back is the
+    one the rows currently reflect. A record that was never applied, or whose
+    mapping pair names slots outside the group (observed in production on
+    discarded ticks), fails the check and contributes nothing -- so recovery can
+    never widen the release beyond slots the group itself displaced.
+    """
+    staged = getattr(group, "pending_orphans", None)
+    if not staged:
+        return window_slots
+    recovered = [window_slots]
+    consumed_idx = set()
+    consumed = 0
+    for i, entry in enumerate(staged):
+        new_slots = entry.new_mapping.flatten().unique()
+        if not bool(torch.isin(new_slots, window_slots).all()):
+            # Stale or foreign: not the write-back the rows reflect.
+            continue
+        old_slots = entry.old_mapping.flatten().unique()
+        displaced = old_slots[~torch.isin(old_slots, window_slots)]
+        recovered.append(displaced)
+        consumed += int(displaced.numel())
+        consumed_idx.add(i)
+    # Consumed records must not be freed again: teardown also runs
+    # _reclaim_orphans, and the allocator would see a double free.
+    group.pending_orphans = [
+        entry for i, entry in enumerate(staged) if i not in consumed_idx
+    ]
+    group.slots_freed = getattr(group, "slots_freed", 0) + consumed
+    return torch.cat(recovered).unique()
 
 
 def remap_kv_mapping(

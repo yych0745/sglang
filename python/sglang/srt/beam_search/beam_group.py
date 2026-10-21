@@ -32,6 +32,7 @@ import torch
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+from sglang.srt.beam_search.trie import BeamTrie
 
 
 class BeamGroupState(enum.Enum):
@@ -69,18 +70,31 @@ class BeamGroup:
         stop_token_ids: Sequence[int] = (),
         max_new_tokens: int,
         num_return: Optional[int] = None,
+        early_stopping: bool = True,
         device: torch.device | str = "cpu",
+        trie: Optional[BeamTrie] = None,
     ):
         self.beam_width = beam_width
         self.num_candidates = 2 * beam_width
         self.length_penalty = length_penalty
         self.max_new_tokens = max_new_tokens
         self.num_return = num_return if num_return is not None else beam_width
+        self.early_stopping = early_stopping
         self.stop_token_ids = torch.tensor(
             sorted(stop_token_ids), dtype=torch.int64, device=device
         )
 
         self.frontier_cum_logprobs = torch.zeros(1, dtype=torch.float32, device=device)
+        # Constrained decoding: the trie and this group's position in it. The
+        # cursor is launch-half state exactly like frontier_cum_logprobs --
+        # same tensor family, same lifetime, advanced in the same call -- so the
+        # two can never disagree. Deliberately NOT on BeamNode: leaves are
+        # retained by `completed` long after the frontier moves on, and dummy
+        # padding aliases one leaf object k times.
+        self.trie = trie
+        self.trie_cursor: Optional[torch.Tensor] = (
+            None if trie is None else trie.root_cursor(1)
+        )
         self.leaves: List[Optional[BeamNode]] = [None]  # parents of the next tokens
         # num_generated is the launch half's count, num_committed the deferred
         # half's (the true length); generated may lead by one under overlap.
@@ -91,6 +105,10 @@ class BeamGroup:
         # Selection results staged by the launch half as (forward tick, sel),
         # consumed in tick order by commit.
         self._pending_steps: List[tuple] = []
+        # Highest forward tick whose selection was folded into the DAG. Under
+        # overlap the launch half can run one step past the group's terminal
+        # commit; that step is discarded, so its tick stays above this mark.
+        self.last_committed_tick = -1
         # Set once by the coordinator when the group leaves the live set
         # (finish / abort / dead-leader); guards double bookkeeping.
         self.retired = False
@@ -135,6 +153,22 @@ class BeamGroup:
         """Launch half of one selection step: evolve the frontier tensor and
         stage the result for commit, stamped with its forward tick."""
         assert self.state == BeamGroupState.DECODING
+        if self.trie is not None:
+            # Pure device walk (segment scan inside advance(), no D2H), so this
+            # stays legal on the launch path. Kept in the same call as the
+            # frontier update because both are launch-half state for one tick.
+            #
+            # Every row advances, including dummy seats. A dummy's cum_logprob
+            # is -inf, so joint_select can never promote it and no candidate of
+            # its row is ever examined: whatever node its cursor names is inert.
+            # Advancing it unconditionally (rather than pinning it) keeps this a
+            # single masked free gather with no data-dependent row selection,
+            # and its parent_idx always names a real row, so the walk stays in
+            # bounds. A dead node (INVALID_NODE) is likewise harmless: mask
+            # releases EOS only, and that row's score is -inf regardless.
+            self.trie_cursor = self.trie.advance(
+                self.trie_cursor, sel.parent_idx, sel.next_tokens
+            )
         self.frontier_cum_logprobs = sel.new_cum_logprobs
         self.num_generated += 1
         self._pending_steps.append((tick, sel))
@@ -159,6 +193,10 @@ class BeamGroup:
             if up_to_tick is not None and tick > up_to_tick:
                 break
             self._pending_steps.pop(0)
+            # Highest tick whose selection actually reached the DAG. Launched
+            # steps beyond it are discarded (overlap overshoot) and their staged
+            # KV side effects must not be treated as committed history.
+            self.last_committed_tick = tick
             finished = (
                 self._commit_final(sel)
                 if isinstance(sel, FinalSelect)
@@ -185,17 +223,49 @@ class BeamGroup:
 
         surv_tokens = sel.next_tokens[:num_survivors].tolist()
         surv_parents = sel.parent_idx[:num_survivors].tolist()
-        self.leaves = [
+        real_leaves = [
             BeamNode(token, self.leaves[parent])
             for token, parent in zip(surv_tokens, surv_parents)
         ]
         self.num_committed = new_len
 
+        if num_survivors == 0:
+            # Nothing legal remains: every examined candidate was a stop token or
+            # masked out. The completed pool is the answer.
+            self.leaves = []
+            self.state = BeamGroupState.FINISHED
+            return True
+
         if num_survivors < self.beam_width:
-            # Not enough live beams to continue: fold the partial frontier into
-            # the pool (unfinished, scored at current length) and finish.
+            # Short step: keep the batch shape fixed by seating dummy leaves
+            # instead of finishing the group. A dummy aliases the best real leaf
+            # so its parent row always resolves, and it is carried at -inf by
+            # joint_select, so it can never win a later selection nor be
+            # committed as a result. This is what constrained decoding needs:
+            # a trie layer with fewer than beam_width legal children must not end
+            # the request.
+            self.leaves = real_leaves + [real_leaves[0]] * (
+                self.beam_width - num_survivors
+            )
+        else:
+            self.leaves = real_leaves
+
+        if self.early_stopping and len(self.completed) >= self.beam_width:
+            # Enough EOS-finished beams collected: further decode cannot improve
+            # the returned set, so stop here instead of running to
+            # max_new_tokens. Matches the upstream beam search semantics (stop
+            # once the completed pool reaches beam_width, or no live beams
+            # remain). Uses beam_width rather than num_return to stay
+            # conservative; switching to num_return would stop even earlier but
+            # could miss longer beams.
+            #
+            # Only EOS beams land in `completed` now, so this counter is exactly
+            # "how many beams finished naturally" -- dummy padding never inflates
+            # it. Runs on the deferred (CPU) half; under overlap the launch half
+            # has already issued one more forward, so one extra step may still be
+            # computed before we stop.
             surv_cums = sel.new_cum_logprobs[:num_survivors].tolist()
-            for leaf, cum in zip(self.leaves, surv_cums):
+            for leaf, cum in zip(real_leaves, surv_cums):
                 self.completed.append(
                     CompletedBeam(leaf, cum, new_len, matched_token=None)
                 )
@@ -215,6 +285,11 @@ class BeamGroup:
             "beam commit consumed an unsynced or misordered step"
         )
         for token, parent, cum in zip(tokens, parents, cums):
+            # A -inf cum means this candidate extends a dummy leaf: it is a
+            # padding artifact, not a real sequence, so it must not reach the
+            # returned pool.
+            if cum == float("-inf"):
+                continue
             leaf = BeamNode(token, self.leaves[parent])
             self.completed.append(CompletedBeam(leaf, cum, new_len, matched_token=None))
         self.leaves = []

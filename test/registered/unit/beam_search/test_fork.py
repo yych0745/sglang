@@ -219,30 +219,268 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
             slots_freed=0,
             retired=False,
             _pending_steps=[],
+            # The remap at tick 7 was folded into the DAG, so its orphans are
+            # real history and must be reclaimed.
+            last_committed_tick=7,
         )
 
         # retract_decode's sequence: member rows released without the
         # coordinator, then the scheduler retires the group.
+        #
+        # free_member_rows reclaims the staged orphans itself now: the record's
+        # new_mapping matches the live window, which proves this remap is the
+        # write-back the rows currently reflect, so the slots it displaced are
+        # the group's and go out with the window in one deduped free.
         free_member_rows(group, pool, allocator)
-        by_rows = sorted(allocator.freed)
-        self.assertEqual(by_rows, [5, 6, 7, 29, 30, 31])
-        # The orphans are disjoint from what the rows still name, which is
-        # exactly why free_member_rows alone leaks them.
-        self.assertFalse(set(orphans) & set(by_rows))
+        freed = sorted(allocator.freed)
+        self.assertEqual(freed, [5, 6, 7, 17, 18, 19, 29, 30, 31])
+        self.assertTrue(set(orphans) <= set(freed))
+        self.assertEqual(group.slots_freed, len(orphans))
+        # Consumed, so the retire below must not free them a second time.
+        self.assertEqual(group.pending_orphans, [])
 
         coordinator = self._make_coordinator(allocator)
         coordinator._num_live_groups = 1
         coordinator._retire_group(group)
 
-        self.assertEqual(sorted(allocator.freed[len(by_rows) :]), orphans)
+        self.assertEqual(sorted(allocator.freed), freed)
         self.assertEqual(group.slots_freed, len(orphans))
         self.assertEqual(group.pending_orphans, [])
         self.assertEqual(coordinator._num_live_groups, 0)
 
         # Retiring twice must not double-free or double-decrement.
         coordinator._retire_group(group)
-        self.assertEqual(len(allocator.freed), len(by_rows) + len(orphans))
+        self.assertEqual(len(allocator.freed), len(freed))
         self.assertEqual(coordinator._num_live_groups, 0)
+
+
+class TestDiscardedTickOrphansAreNotFreed(CustomTestCase):
+    """Regression: under overlap the launch half can stage one remap past the
+    group's terminal commit. commit_pending throws that selection away, so its
+    mapping pair was never validated against the DAG -- and in production it was
+    observed to name slots the group never owned. Freeing them pushed the pool's
+    available count above total (another request's KV released). Teardown must
+    reclaim only the ticks the DAG actually consumed."""
+
+    @staticmethod
+    def _make_coordinator(allocator, pool):
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+
+        return BeamCoordinator(
+            model_config=None,
+            spec_algorithm=None,
+            dllm_enabled=False,
+            max_req_len=0,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=None,
+            future_map=None,
+        )
+
+    def _make_group(self, rows, committed_orphans, discarded_orphans, last_tick):
+        return SimpleNamespace(
+            leader=SimpleNamespace(
+                kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
+            ),
+            prompt_len=5,
+            beam_width=3,
+            member_rows=torch.tensor([1, 2], dtype=torch.int64),
+            member_rows_cpu=torch.tensor([1, 2], dtype=torch.int64),
+            all_rows=rows,
+            pending_orphans=[
+                StagedOrphans(5, *committed_orphans),
+                StagedOrphans(9, *discarded_orphans),
+            ],
+            slots_freed=0,
+            retired=False,
+            _pending_steps=[],
+            last_committed_tick=last_tick,
+        )
+
+    def test_teardown_skips_orphans_from_an_uncommitted_tick(self):
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        rows = torch.tensor([0, 1, 2], dtype=torch.int64)
+
+        # Tick 5: a genuine remap the DAG consumed. Row 1 is nobody's parent,
+        # so its window [5, 8) -- slots 17, 18, 19 -- is truly orphaned.
+        committed = remap_kv_mapping(
+            req_to_token.clone(),
+            rows,
+            torch.tensor([0, 2, 2], dtype=torch.int64),
+            prefix_len=5,
+            seq_len=8,
+        )
+        # Tick 9: staged by the launch half after the terminal commit. Its
+        # "orphans" are slots outside this group entirely -- freeing them is
+        # what corrupted the pool.
+        foreign_old = torch.tensor([[900, 901, 902]], dtype=torch.int64)
+        foreign_new = torch.tensor([[900, 900, 900]], dtype=torch.int64)
+        discarded_slots = {901, 902}
+
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        group = self._make_group(
+            rows, committed, (foreign_old, foreign_new), last_tick=5
+        )
+
+        coordinator = self._make_coordinator(allocator, pool)
+        coordinator._num_live_groups = 1
+        coordinator._reclaim_orphans(group)
+
+        freed = set(allocator.freed)
+        self.assertEqual(sorted(freed), [17, 18, 19])
+        self.assertFalse(freed & discarded_slots)
+        # Only the committed tick's orphans are accounted for.
+        self.assertEqual(group.slots_freed, 3)
+        # Both entries leave the queue: the discarded one is dropped, not
+        # deferred, so it cannot be freed by a later teardown either.
+        self.assertEqual(group.pending_orphans, [])
+
+    def test_teardown_reclaims_every_committed_tick(self):
+        # Same two entries, but now the DAG consumed both: nothing is dropped.
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        rows = torch.tensor([0, 1, 2], dtype=torch.int64)
+        committed = remap_kv_mapping(
+            req_to_token.clone(),
+            rows,
+            torch.tensor([0, 2, 2], dtype=torch.int64),
+            prefix_len=5,
+            seq_len=8,
+        )
+        second_old = torch.tensor([[900, 901, 902]], dtype=torch.int64)
+        second_new = torch.tensor([[900, 900, 900]], dtype=torch.int64)
+
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        group = self._make_group(
+            rows, committed, (second_old, second_new), last_tick=9
+        )
+
+        coordinator = self._make_coordinator(allocator, pool)
+        coordinator._num_live_groups = 1
+        coordinator._reclaim_orphans(group)
+
+        self.assertEqual(sorted(allocator.freed), [17, 18, 19, 901, 902])
+        self.assertEqual(group.slots_freed, 5)
+
+
+class TestStrandedSlotsFromDiscardedTick(CustomTestCase):
+    """Regression: early_stopping finishes a group mid-remap, so under overlap
+    the launch half has already written req_to_token for a tick the commit half
+    then throws away. Dropping that tick's orphan record (correct -- it was
+    never validated) leaves the slots it displaced referenced by nobody: the
+    rows now name the parents' slots, so free_member_rows' window-based dedup
+    free cannot see them either. They are stranded, and the pool's available
+    count drops below total once per finished group.
+
+    free_member_rows must release the union of the current window and the
+    staged old_mappings, which recovers exactly the group's own stranded slots
+    without ever naming a slot the group does not own."""
+
+    def test_free_member_rows_recovers_slots_stranded_by_a_dropped_tick(self):
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        rows = torch.tensor([0, 1, 2], dtype=torch.int64)
+
+        # The launch half's remap for the tick that commit will discard: rows 1
+        # and 2 adopt row 2's window, so row 1's original slots 17, 18, 19 stop
+        # being referenced by any row the moment this is written back.
+        old_map, new_map = remap_kv_mapping(
+            req_to_token,
+            rows,
+            torch.tensor([0, 2, 2], dtype=torch.int64),
+            prefix_len=5,
+            seq_len=8,
+        )
+        stranded = sorted(collect_orphan_slots(old_map, new_map).tolist())
+        self.assertEqual(stranded, [17, 18, 19])
+
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        group = SimpleNamespace(
+            leader=SimpleNamespace(
+                kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
+            ),
+            prompt_len=5,
+            member_rows=torch.tensor([1, 2], dtype=torch.int64),
+            member_rows_cpu=torch.tensor([1, 2], dtype=torch.int64),
+            all_rows=rows,
+            # The record survives teardown's tick filter being applied first:
+            # _reclaim_orphans dropped it because 9 > last_committed_tick, so
+            # free_member_rows is the only remaining chance to recover them.
+            pending_orphans=[StagedOrphans(9, old_map, new_map)],
+            slots_freed=0,
+            last_committed_tick=5,
+        )
+
+        free_member_rows(group, pool, allocator)
+
+        # Everything the group ever held in [5, 8): what the rows name now
+        # (the parents' slots) plus the slots the discarded remap displaced.
+        window = sorted(set(req_to_token[rows, 5:8].flatten().tolist()))
+        self.assertEqual(sorted(set(allocator.freed)), sorted(set(window + stranded)))
+        for slot in stranded:
+            self.assertIn(slot, allocator.freed)
+        # Freed once each: the union is deduplicated, as the group's rows share
+        # slots after every reparent.
+        self.assertEqual(len(allocator.freed), len(set(allocator.freed)))
+
+    def test_no_staged_records_frees_exactly_the_window(self):
+        # Guard against over-freeing: with nothing staged the behaviour must be
+        # byte-for-byte the window-only release.
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        rows = torch.tensor([0, 1, 2], dtype=torch.int64)
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        group = SimpleNamespace(
+            leader=SimpleNamespace(
+                kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
+            ),
+            prompt_len=5,
+            member_rows=torch.tensor([1, 2], dtype=torch.int64),
+            member_rows_cpu=torch.tensor([1, 2], dtype=torch.int64),
+            all_rows=rows,
+            pending_orphans=[],
+            slots_freed=0,
+            last_committed_tick=5,
+        )
+
+        free_member_rows(group, pool, allocator)
+
+        expected = sorted(set(req_to_token[rows, 5:8].flatten().tolist()))
+        self.assertEqual(sorted(allocator.freed), expected)
+
+    def test_stranded_recovery_never_frees_a_foreign_slot(self):
+        # The discarded tick's mapping pair was never validated, and in
+        # production it was seen naming slots outside the group. Recovery is
+        # scoped by intersecting with the group's own rows, so a foreign slot
+        # in old_mapping must not reach the allocator.
+        req_to_token = torch.arange(36, dtype=torch.int64).reshape(3, 12)
+        rows = torch.tensor([0, 1, 2], dtype=torch.int64)
+        window_before = sorted(set(req_to_token[rows, 5:8].flatten().tolist()))
+
+        foreign_old = torch.tensor([[900, 901, 902]], dtype=torch.int64)
+        foreign_new = torch.tensor([[900, 900, 900]], dtype=torch.int64)
+
+        pool = _FakeReqToTokenPool(req_to_token)
+        allocator = _FakeAllocator()
+        group = SimpleNamespace(
+            leader=SimpleNamespace(
+                kv=ReqKvInfo(kv_allocated_len=8, kv_committed_len=8),
+            ),
+            prompt_len=5,
+            member_rows=torch.tensor([1, 2], dtype=torch.int64),
+            member_rows_cpu=torch.tensor([1, 2], dtype=torch.int64),
+            all_rows=rows,
+            pending_orphans=[StagedOrphans(9, foreign_old, foreign_new)],
+            slots_freed=0,
+            last_committed_tick=5,
+        )
+
+        free_member_rows(group, pool, allocator)
+
+        freed = set(allocator.freed)
+        self.assertFalse(freed & {900, 901, 902})
+        self.assertEqual(sorted(freed), window_before)
 
 
 class TestNeutralParams(CustomTestCase):

@@ -181,6 +181,16 @@ class ExecKernel(msgspec.Struct):
             choices=GRAMMAR_BACKEND_CHOICES,
         ),
     ] = None
+    beam_trie_path: A[
+        Optional[str],
+        Arg(
+            help="Dictionary of <a_N><b_N><c_N> product SIDs. When set, beam "
+            "search requests are constrained to paths of this trie: only tokens "
+            "that extend a real dictionary entry may be selected, and a "
+            "completed entry can only be followed by EOS. Unset (default) "
+            "leaves beam search unconstrained.",
+        ),
+    ] = None
     fp8_gemm_runner_backend: A[
         str,
         Arg(
