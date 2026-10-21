@@ -194,6 +194,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     h0,
     ht,
     ssm_state_indices,
+    src_ssm_state_indices,
     scale,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
@@ -209,6 +210,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    HAS_SRC_SSM_STATE_INDICES: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -221,6 +223,14 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     mask_h = mask_v[:, None] & mask_k[None, :]
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+    # Beam-search COW: read the parent's recurrent state, write the freshly
+    # allocated one. Folded away when the caller passes no src indices.
+    if HAS_SRC_SSM_STATE_INDICES:
+        src_state_idx = tl.load(src_ssm_state_indices + i_n * stride_indices_seq).to(
+            tl.int64
+        )
+    else:
+        src_state_idx = state_idx
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
     if state_idx < 0:
@@ -228,7 +238,15 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
         tl.store(p_o, zero, mask=mask_v)
         return
 
-    p_h0 = h0 + state_idx * stride_init_state_token
+    # A skipped source is as unusable as a skipped destination: there is no
+    # parent state to continue from, so emit zeros rather than read slot -1.
+    if HAS_SRC_SSM_STATE_INDICES:
+        if src_state_idx < 0:
+            zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
+            tl.store(p_o, zero, mask=mask_v)
+            return
+
+    p_h0 = h0 + src_state_idx * stride_init_state_token
     p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
     b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -277,6 +295,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    src_ssm_state_indices: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if mixed_qkv.ndim != 2:
         raise ValueError(
@@ -298,6 +317,27 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"`ssm_state_indices` must be 1D for packed decode (got ndim={ssm_state_indices.ndim})."
         )
+    if src_ssm_state_indices is not None:
+        # Beam-search COW read slots. The kernel indexes both tensors with the
+        # same stride_indices_seq, so any layout mismatch would silently read
+        # the wrong rows rather than fail.
+        if src_ssm_state_indices.ndim != 1:
+            raise ValueError(
+                f"`src_ssm_state_indices` must be 1D (got ndim={src_ssm_state_indices.ndim})."
+            )
+        if src_ssm_state_indices.shape != ssm_state_indices.shape:
+            raise ValueError(
+                "`src_ssm_state_indices` must have the same shape as "
+                f"`ssm_state_indices` (got {tuple(src_ssm_state_indices.shape)} "
+                f"vs {tuple(ssm_state_indices.shape)})."
+            )
+        if src_ssm_state_indices.stride(0) != ssm_state_indices.stride(0):
+            raise ValueError(
+                "`src_ssm_state_indices` must share the stride of "
+                "`ssm_state_indices`; the kernel reads both with one stride."
+            )
+        if src_ssm_state_indices.device != ssm_state_indices.device:
+            raise ValueError("All inputs must be on the same device.")
     if not out.is_contiguous():
         raise ValueError("`out` must be contiguous.")
 
@@ -382,6 +422,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         h0=initial_state,
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
+        src_ssm_state_indices=src_ssm_state_indices,
         scale=scale,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
@@ -397,6 +438,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        HAS_SRC_SSM_STATE_INDICES=src_ssm_state_indices is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

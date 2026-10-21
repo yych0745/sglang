@@ -73,6 +73,12 @@ class TritonGDNKernel(LinearAttnKernelBase):
             num_v_heads: number of value heads (after TP sharding).
             head_v_dim: dimension per value head.
 
+        Keyword Args:
+            src_cache_indices: [B] beam-search copy-on-write read slots. When
+                given, the recurrent state is READ from these and WRITTEN to
+                cache_indices, so a just-reparented beam continues from its
+                parent without a separate state copy.
+
         Returns:
             output tensor of shape [1, B, HV, V] matching the existing
             decode kernel output layout.
@@ -80,6 +86,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         B = mixed_qkv.shape[0]
         # Packed kernel expects output shape [B, 1, HV, V]
         out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
+        src_cache_indices = kwargs.get("src_cache_indices")
 
         # GDN ReplaySSM buffered decode (slice 1a). Drop-in for the packed
         # decode: same args plus the three per-layer ring caches and the
@@ -99,6 +106,16 @@ class TritonGDNKernel(LinearAttnKernelBase):
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
+            if src_cache_indices is not None:
+                # The replay path rebuilds state from its own ring buffers,
+                # which are indexed by the write slot alone. There is nowhere
+                # to express "read elsewhere", so honouring the COW mapping
+                # here would silently read the slot it is about to write.
+                raise NotImplementedError(
+                    "beam-search COW (src_cache_indices) is not supported by "
+                    "the GDN ReplaySSM decode path; run beam search without "
+                    "ReplaySSM."
+                )
             fused_recurrent_gdn_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -128,6 +145,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=ssm_states,
             out=out,
             ssm_state_indices=cache_indices,
+            src_ssm_state_indices=src_cache_indices,
             use_qk_l2norm_in_kernel=True,
         )
 
