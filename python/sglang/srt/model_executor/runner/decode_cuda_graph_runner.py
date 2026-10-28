@@ -680,11 +680,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # mapping would be dropped by a replay and the rows would silently
         # decode from the wrong state. Refuse rather than replay wrong; the
         # hybrid backend additionally raises if a mapping ever reaches a replay.
-        if getattr(forward_batch, "beam_num_tail_rows", 0):
-            return False
-        # beam_width=1 prunes too: it has no member rows, so the check above
-        # sees nothing, but the leader row is still handed a fresh slot and a
-        # read mapping. Ask the pool directly -- that covers every group shape.
+        #
+        # Gate on the mapping itself, not on `beam_num_tail_rows`: a plain
+        # attention beam never arms a COW mapping, so it replays fine and
+        # should not be pushed off the graph. Asking the pool also covers every
+        # group shape, including beam_width=1, which has no member rows but
+        # still prunes its leader row.
         pending = getattr(self.model_runner.req_to_token_pool,
                           "beam_cow_read_mapping_pending", None)
         if pending is not None and pending():
