@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -1505,6 +1505,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
     # Deliberately NOT folded into alloc_rows(): alloc() routes through it too,
     # and a mamba slot per row there would double-allocate on top of the one
     # alloc() itself issues per Req. Non-beam traffic keeps using alloc().
+    #
+    # Ownership and inheritance are two separate calls on purpose -- see
+    # fork_mamba_from_row -- because only some of these transitions want a
+    # state copy to go with the slot.
 
     def alloc_mamba_for_rows(self, rows: torch.Tensor) -> Optional[torch.Tensor]:
         """Give every row in `rows` its own mamba slot and install it in the
@@ -1541,6 +1545,61 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         self.req_index_to_mamba_index_mapping[rows] = slots
         return slots
+
+    def fork_mamba_from_row(self, src_row, dst_rows: torch.Tensor) -> None:
+        """Fill already-owned member slots with the leader's SSM state.
+
+        The second half of a beam spawn, after `alloc_mamba_for_rows` has given
+        every member row a slot of its own. Owning a slot says nothing about
+        what is in it: an allocator-issued slot holds whatever the previous
+        tenant left (zeros on a fresh server), so without this a member's first
+        decode tick runs on a state that never saw the prompt -- every beam but
+        the leader starts from a wrong place and drifts. The members are forks
+        of the leader at `prompt_len`, so the state they must inherit is the
+        one the leader's prefill just wrote.
+
+        `src_row` is the leader's row (an int or a 0-d index tensor); it must
+        already have finished its prefill, and `dst_rows` must already own their
+        slots. Both sides are translated virtual -> physical, because `copy_from`
+        addresses the state tensors while the table holds virtual ids. Empty
+        `dst_rows` (beam_width == 1 spawns nothing) is a no-op.
+
+        Deliberately NOT folded into `alloc_mamba_for_rows`: that one means
+        "take clean ownership of a slot", and `replace_mamba_for_rows` reuses
+        it as the fork's allocate step precisely because it inherits nothing.
+        Who holds the state to inherit is known only to the caller (the spawn),
+        so inheritance stays its own call.
+
+        ReplaySSM: the source must be a flushed checkpoint (empty ring), which
+        holds by construction here -- a slot starts at write_pos 0 (`alloc`),
+        only decode advances the cursor, and prefill never writes the ring, so
+        a leader that has just prefilled is empty. Asserted in debug mode only:
+        that is the one place a check may sync, and it matches `copy_from`.
+        """
+        if int(dst_rows.numel()) == 0:
+            return
+        src_slot = self.req_index_to_mamba_index_mapping[src_row]
+        dst_slots = self.req_index_to_mamba_index_mapping[dst_rows]
+        if (
+            self.mamba_pool.replayssm_write_pos is not None
+            and getattr(self.mamba_pool, "debug_memory_pool", False)
+        ):
+            # Debug-only (syncs): copy_from carries `temporal` but not the ring,
+            # so an un-flushed source would silently drop its pending entries.
+            src_wp = self.mamba_pool.replayssm_write_pos[src_slot]
+            assert bool((src_wp == 0).item()), (
+                "beam spawn fork requires a fully-flushed ReplaySSM source "
+                f"(write_pos==0), got {int(src_wp)} for the leader's slot "
+                f"{int(src_slot)}; the leader must have just finished prefill"
+            )
+        # Every member inherits the same slot: a repeated source index is a
+        # read-only gather, and the destinations are freshly allocated, hence
+        # distinct and disjoint from it.
+        src = src_slot.expand(dst_rows.numel())
+        self.mamba_pool.copy_from(
+            self.translate_mamba_indices(src),
+            self.translate_mamba_indices(dst_slots),
+        )
 
     def free_mamba_for_rows(self, rows: torch.Tensor) -> None:
         """Hand the slots owned by `rows` back to the allocator and zero their
@@ -1591,14 +1650,37 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ) -> Optional[torch.Tensor]:
         """Source slots for this forward, or None when nothing was pruned (in
         which case the caller uses get_mamba_indices, i.e. read == write)."""
-        return self.beam_mamba_cow.read_mapping_for(req_indices)
+        return self.beam_mamba_cow.read_mapping_for(
+            req_indices, self.req_index_to_mamba_index_mapping
+        )
 
     def set_beam_cow_read_mapping(
-        self, req_pool_indices: torch.Tensor, src_mamba_idx: torch.Tensor
+        self,
+        req_pool_indices: torch.Tensor,
+        src_mamba_idx: torch.Tensor,
+        rows_cpu: Optional[Sequence[int]] = None,
     ) -> None:
+        """`rows_cpu` is the same row numbers on the host; the group's retire
+        path needs them to withdraw these rows if the snapshot is never
+        consumed (see BeamMambaCow.set_read_mapping)."""
         self.beam_mamba_cow.set_read_mapping(
-            self.req_index_to_mamba_index_mapping, req_pool_indices, src_mamba_idx
+            self.req_index_to_mamba_index_mapping,
+            req_pool_indices,
+            src_mamba_idx,
+            rows_cpu,
         )
+
+    def forget_beam_cow_rows(
+        self, req_pool_indices: torch.Tensor, rows_cpu: Sequence[int]
+    ) -> None:
+        """Withdraw a retiring group's rows from an unconsumed snapshot.
+
+        Without it a group that ends in the same commit as its last prune
+        leaves a mapping armed for rows the next request will be given, and
+        that request's first decode reads freed slots. No-op when no mapping is
+        armed, and absent entirely on a non-hybrid pool (callers use getattr).
+        """
+        self.beam_mamba_cow.forget_rows(req_pool_indices, rows_cpu)
 
     def clear_beam_cow_read_mapping(self) -> None:
         self.beam_mamba_cow.clear_read_mapping()

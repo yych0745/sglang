@@ -52,6 +52,36 @@ logger = logging.getLogger(__name__)
 REQUEST_REASONING_END_TOKEN_IDS_KEY = "__sglang_reasoning_end_token_ids"
 MAX_REQUEST_REASONING_END_TOKEN_IDS = 32
 
+# Beam-search early-stopping modes; must stay in sync with
+# sglang.srt.beam_search.beam_group.EARLY_STOPPING_MODES. Kept as its own copy
+# because sampling_params cannot import the beam package (it would close an
+# import cycle through the scheduler), and the wire contract is what lives here.
+_EARLY_STOPPING_MODES = ("off", "false", "true", "never")
+
+
+def _normalize_early_stopping(value: Union[str, bool, None]) -> str:
+    """Normalize `early_stopping` to one of _EARLY_STOPPING_MODES.
+
+    Booleans are the historical wire form (the HTTP layer still sends them) and
+    are mapped for backward compatibility: True -> "true", False -> "off".
+    Anything else raises, so a typo is reported at request construction rather
+    than silently becoming one of the modes.
+    """
+    if value is None:
+        return "off"
+    if isinstance(value, bool):
+        return "true" if value else "off"
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in _EARLY_STOPPING_MODES:
+            return mode
+    raise ValueError(
+        "early_stopping must be one of "
+        f"{', '.join(repr(m) for m in _EARLY_STOPPING_MODES)} "
+        "(a bool is also accepted: True -> 'true', False -> 'off'), "
+        f"got {value!r}."
+    )
+
 
 def get_request_reasoning_end_token_ids(
     custom_params: Optional[Dict[str, CustomParamValue]],
@@ -145,10 +175,24 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     # 1.0 = standard length normalization, < 1.0 favors shorter sequences,
     # > 1.0 favors longer ones. Only affects beam search requests.
     length_penalty: float = 1.0
-    # Early stopping for beam search: stop once enough finished beams are
-    # collected (>= beam_width) or no live beams remain, instead of always
-    # running to max_new_tokens. Only affects beam search requests.
-    early_stopping: bool = True
+    # Early-stopping mode for beam search. Only affects beam search requests.
+    # One of "off" | "false" | "true" | "never":
+    #   "off"   never stop early; decode to max_new_tokens (the default).
+    #   "true"  stop as soon as beam_width beams have finished naturally
+    #           (transformers `early_stopping=True`).
+    #   "false" stop when the best live beam cannot beat the worst returned
+    #           candidate at its current length (transformers'
+    #           `early_stopping=False` heuristic).
+    #   "never" the same bound taken at max_new_tokens while length_penalty > 0,
+    #           i.e. a lossless version of "false" that never truncates a beam
+    #           that could still win.
+    #
+    # BREAKING CHANGE: this used to be a bool defaulting to True (== "true"),
+    # so beam search stopped as soon as the completed pool filled. The default
+    # is now "off": a request runs to max_new_tokens unless it opts in. Booleans
+    # are still accepted and mapped (True -> "true", False -> "off"), so callers
+    # that pass them keep their meaning.
+    early_stopping: Union[str, bool] = "off"
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
@@ -206,8 +250,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.length_penalty = (
             self.length_penalty if self.length_penalty is not None else 1.0
         )
-        self.early_stopping = (
-            self.early_stopping if self.early_stopping is not None else True
+        self.early_stopping = _normalize_early_stopping(
+            self.early_stopping if self.early_stopping is not None else "off"
         )
         self.ignore_eos = self.ignore_eos if self.ignore_eos is not None else False
         self.skip_special_tokens = (

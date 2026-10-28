@@ -2520,6 +2520,9 @@ class Scheduler(
             enable_beam_mamba_double_buffer=getattr(
                 self.server_args, "enable_beam_mamba_double_buffer", False
             ),
+            enable_beam_mamba_state_copy=getattr(
+                self.server_args, "enable_beam_mamba_state_copy", False
+            ),
         )
 
     def _load_beam_trie(self):

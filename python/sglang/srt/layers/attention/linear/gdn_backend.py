@@ -694,32 +694,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "(projected_qkvz, projected_ba)"
                 )
             projected_qkvz, projected_ba = mixed_qkv
-            eligible, eligibility_reason = (
-                can_use_fused_qkvzba_causal_conv1d_update_contiguous(
-                    projected_qkvz,
-                    projected_ba,
-                    conv_states,
-                    layer.conv_weights,
-                    layer.bias,
-                    cache_indices,
-                    qkv_dim=layer.q_dim + layer.k_dim + layer.v_dim,
-                    v_dim=layer.v_dim,
-                    num_v_heads=layer.num_v_heads,
-                    activation=layer.activation,
+            if src_cache_indices is not None:
+                # The fused QKVZ/BA unpack updates conv state in place on
+                # conv_states[cache_indices] and has nowhere to express "read
+                # another slot". Fall through to the unfused path below, which
+                # goes through causal_conv1d_update and does carry the COW read
+                # slots. Only beam prune ticks take this branch, so ordinary
+                # decodes keep the fusion.
+                eligible, eligibility_reason = (
+                    False,
+                    "beam-search COW read mapping is active",
                 )
-            )
-            if eligible:
-                if src_cache_indices is not None:
-                    # The fused QKVZ/BA unpack performs the conv state update
-                    # in place on conv_states[cache_indices]; it has nowhere to
-                    # express "read another slot". Honouring COW here would
-                    # silently read the slot it is about to overwrite.
-                    raise NotImplementedError(
-                        "beam-search COW (src_mamba_cache_indices) is not "
-                        "supported by the fused GDN decode QKVZ/BA projection + "
-                        "Conv1D path, which reads and writes the same conv slot. "
-                        "Disable that fusion to run beam search."
+            else:
+                eligible, eligibility_reason = (
+                    can_use_fused_qkvzba_causal_conv1d_update_contiguous(
+                        projected_qkvz,
+                        projected_ba,
+                        conv_states,
+                        layer.conv_weights,
+                        layer.bias,
+                        cache_indices,
+                        qkv_dim=layer.q_dim + layer.k_dim + layer.v_dim,
+                        v_dim=layer.v_dim,
+                        num_v_heads=layer.num_v_heads,
+                        activation=layer.activation,
                     )
+                )
+            if eligible:
                 qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
                 fused_backend = "triton_direct_oracle_exact"
                 if not _fused_decode_proj_conv_logged:

@@ -36,11 +36,26 @@ the kernel this tick. Returning them to the allocator now lets the next
 allocation hand the same slot to another request, which would then overwrite
 state the current step still needs. They are released at the top of the next
 decode instead.
+
+a snapshot must not outlive its group's ownership of the rows. The mapping is
+armed by a prune and meant to be consumed by the next decode. But a group can
+end in the very commit that follows the arming (early stopping, abort,
+retraction), and then no decode ever comes: the mapped rows go back to the
+allocator and the next request admitted gets them. A snapshot naming them is
+still in place, so that request's first decode reads the source slots its
+predecessor detached and freed -- a use-after-free on someone else's state.
+`forget_rows` is the undo: it drops a retiring group's own rows from the
+snapshot without disturbing rows another group armed in the same tick.
+
+Known remaining defect (not fixed here): the snapshot is cleared wholesale by
+whatever decode forward consumes it, including a forward that carries none of
+the rows it names. Pruning groups therefore have to share a tick today; making
+the clear row-scoped is a separate change.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -57,22 +72,44 @@ class BeamMambaCow:
         # Snapshot of req_index_to_mamba_index_mapping with the pruned rows
         # redirected to their parents. None means "no prune this tick".
         self._read_mapping: Optional[torch.Tensor] = None
+        # Rows the snapshot actually applies to; everything else reads live.
+        self._pruned_mask: Optional[torch.Tensor] = None
         # Slots detached this tick, still under read by the in-flight kernel.
         self._source_slots: Optional[torch.Tensor] = None
+        # Host-side mirror of the rows the snapshot is armed for, one entry per
+        # `set_read_mapping` call. Kept so a group that ends before anything
+        # consumed the snapshot can withdraw its own rows (see `forget_rows`)
+        # without a device->host sync of `_pruned_mask`.
+        self._armed_rows: set[int] = set()
 
     # ---- read side -------------------------------------------------------
 
-    def read_mapping_for(self, req_indices: torch.Tensor) -> Optional[torch.Tensor]:
-        """Source slots for these req rows, or None when nothing was pruned."""
+    def read_mapping_for(
+        self, req_indices: torch.Tensor, base_mapping: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Source slots for these req rows, or None when nothing was pruned.
+
+        Only rows this tick actually pruned are served from the snapshot; every
+        other row reads `base_mapping`, the live table. The snapshot is a full
+        copy of the table as it looked mid-prune, so a row that was handed a
+        slot *after* the snapshot was taken -- any request admitted later in
+        the same tick -- would otherwise be sent to whatever slot it held
+        before, i.e. state belonging to a different request.
+        """
         if self._read_mapping is None:
             return None
-        return self._read_mapping[req_indices]
+        return torch.where(
+            self._pruned_mask[req_indices],
+            self._read_mapping[req_indices],
+            base_mapping[req_indices],
+        )
 
     def set_read_mapping(
         self,
         base_mapping: torch.Tensor,
         req_indices: torch.Tensor,
         src_slots: torch.Tensor,
+        rows_cpu: Optional[Sequence[int]] = None,
     ) -> None:
         """Redirect `req_indices` to `src_slots` for this tick only.
 
@@ -82,16 +119,64 @@ class BeamMambaCow:
         kernel would read the very slot it is about to write. Later calls in
         the same tick reuse the existing snapshot for the same reason: the
         earlier group's rows have already been moved in `base_mapping`.
+
+        `_pruned_mask` records which rows this applies to, so rows nobody
+        pruned keep reading the live table (see `read_mapping_for`).
+
+        `rows_cpu` is the same row numbers as `req_indices`, on the host. It is
+        recorded in `_armed_rows` so `forget_rows` can withdraw them later.
+        Production callers MUST pass it: the fallback reads `req_indices` back
+        off the device, which is a sync, and it is only here for tests and
+        cold paths.
         """
         if self._read_mapping is None:
             self._read_mapping = base_mapping.clone()
+            self._pruned_mask = torch.zeros(
+                base_mapping.shape[0], dtype=torch.bool, device=base_mapping.device
+            )
         self._read_mapping[req_indices] = src_slots.to(
             dtype=self._read_mapping.dtype
         )
+        self._pruned_mask[req_indices] = True
+        self._armed_rows.update(req_indices.tolist() if rows_cpu is None else rows_cpu)
+
+    def forget_rows(self, req_indices: torch.Tensor, rows_cpu: Sequence[int]) -> None:
+        """Withdraw one group's rows from an unconsumed snapshot.
+
+        The snapshot is supposed to live for exactly one thing: the decode that
+        follows the prune that armed it, which reads the parent's state through
+        it. But nothing guarantees that decode happens -- the group can finish
+        in the very commit that follows (early stopping, abort, retraction),
+        and then its rows go back to the allocator while the snapshot is still
+        armed for them. The next request admitted gets those row numbers, and
+        its first decode would read through the leftover mapping: slots the
+        previous group detached and freed, i.e. a use-after-free on state that
+        now belongs to somebody else.
+
+        So a retiring group withdraws its rows here. Only its own rows: another
+        group that pruned in the same tick shares this snapshot and is still
+        waiting for its decode, so its entries stay. Once no group is left
+        waiting the whole snapshot is dropped, which also reopens the cuda
+        graph gate that `read_mapping_pending` closes.
+
+        Device-side work only (`_pruned_mask` write) plus host-side set
+        arithmetic -- no sync. A no-op when there is no snapshot, so it is safe
+        to call on every retire.
+        """
+        if self._read_mapping is None:
+            return
+        self._pruned_mask[req_indices] = False
+        self._armed_rows.difference_update(rows_cpu)
+        if not self._armed_rows:
+            # Nobody is waiting for this snapshot any more; keeping it would
+            # only serve stale entries to whoever gets these rows next.
+            self.clear_read_mapping()
 
     def clear_read_mapping(self) -> None:
         """Drop the mapping after one forward has consumed it."""
         self._read_mapping = None
+        self._pruned_mask = None
+        self._armed_rows.clear()
 
     def read_mapping_pending(self) -> bool:
         """Whether a prune's mapping is still unconsumed.
@@ -133,4 +218,6 @@ class BeamMambaCow:
     def reset(self) -> None:
         """Forget both halves. Used by the pool's own clear()."""
         self._read_mapping = None
+        self._pruned_mask = None
         self._source_slots = None
+        self._armed_rows.clear()

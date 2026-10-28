@@ -11,7 +11,9 @@ the COW, and the two guards that keep it from being silently dropped.
   - admission: mamba still refuses beam search without the switch, SWA always
               refuses it;
   - graph:    a batch carrying beam rows never replays a cuda graph, and if a
-              mapping ever does reach a replay the backend says so loudly.
+              mapping ever does reach a replay the backend says so loudly;
+  - copy:     the --enable-beam-mamba-state-copy alternative, which copies the
+              state outright instead of arming a read mapping.
 
 Pure CPU tensor bookkeeping: the pool is built with only the mamba accounting
 the methods touch, so the real method bodies run.
@@ -273,7 +275,7 @@ class TestMambaAdmissionGate(CustomTestCase):
             ),
         )
 
-    def _validate(self, *, swa, mamba, double_buffer=False):
+    def _validate(self, *, swa, mamba, double_buffer=False, state_copy=False):
         coord = BeamCoordinator(
             model_config=SimpleNamespace(vocab_size=1000, is_encoder_decoder=False),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
@@ -286,6 +288,7 @@ class TestMambaAdmissionGate(CustomTestCase):
             ),
             future_map=None,
             enable_beam_mamba_double_buffer=double_buffer,
+            enable_beam_mamba_state_copy=state_copy,
         )
         req, recv_req = self._req()
         # The checks before the SWA/mamba gate read the published runtime
@@ -326,6 +329,17 @@ class TestMambaAdmissionGate(CustomTestCase):
     def test_mamba_is_allowed_when_the_switch_is_on(self):
         self.assertIsNone(self._validate(swa=False, mamba=True, double_buffer=True))
 
+    def test_mamba_is_allowed_with_only_the_state_copy_switch(self):
+        # The true-copy path is a complete opt-in on its own: it never arms a
+        # read mapping, so it needs nothing from the double buffer.
+        self.assertIsNone(self._validate(swa=False, mamba=True, state_copy=True))
+
+    def test_mamba_is_allowed_with_both_switches(self):
+        # Both on: admission does not care which one the prune will pick.
+        self.assertIsNone(
+            self._validate(swa=False, mamba=True, double_buffer=True, state_copy=True)
+        )
+
     def test_swa_is_refused_even_with_the_switch_on(self):
         error = self._validate(swa=True, mamba=False, double_buffer=True)
 
@@ -365,7 +379,13 @@ class TestDecodeGraphRefusesBeamBatches(CustomTestCase):
         runner.attention_graph_variants = None
         runner.captured_req_width = 1
         runner.model_runner = SimpleNamespace(
-            spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
+            spec_algorithm=SimpleNamespace(is_ngram=lambda: False),
+            # can_run_graph also asks the pool whether a prune mapping is
+            # pending: beam_width=1 prunes without producing member rows, so
+            # the row count alone does not catch it.
+            req_to_token_pool=SimpleNamespace(
+                beam_cow_read_mapping_pending=lambda: False
+            ),
         )
         return runner
 
@@ -439,6 +459,318 @@ class TestDecodeGraphRefusesBeamBatches(CustomTestCase):
         self.assertFalse(pool.beam_cow_read_mapping_pending())
         pool.set_beam_cow_read_mapping(rows, torch.tensor([1, 1], dtype=torch.int32))
         self.assertTrue(pool.beam_cow_read_mapping_pending())
+
+
+class _CpuMambaPool:
+    """MambaPool stand-in carrying observable state.
+
+    Only what the state-copy prune touches: a `temporal` tensor indexed the way
+    `MambaPool.copy_from` indexes it ([layers, slots, dim]), the ReplaySSM ring
+    cursor, and a `copy_from` that performs the copy and records its arguments.
+
+    It also enforces the src/dst disjointness the real fused copy asserts. That
+    is the whole reason the prune allocates fresh slots first: an in-place copy
+    would hand overlapping sets here on a self-parented row.
+    """
+
+    def __init__(self, size: int, state_dim: int = 3, replayssm: bool = False):
+        self.size = size
+        self.temporal = torch.zeros(1, size + 1, state_dim)
+        self.replayssm_write_pos = (
+            torch.zeros(size + 1, dtype=torch.int64) if replayssm else None
+        )
+        self.calls = []
+
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+        src = src_indices.tolist()
+        dst = dst_indices.tolist()
+        overlap = set(src) & set(dst)
+        assert not overlap, (
+            "copy_from requires disjoint src/dst slots; "
+            f"overlap={sorted(overlap)}"
+        )
+        self.calls.append((src, dst))
+        self.temporal[:, dst] = self.temporal[:, src]
+
+
+class _CpuStateCopyPool(_CpuHybridPool):
+    """_CpuHybridPool with a mamba_pool the copy path can actually copy from."""
+
+    def __init__(
+        self, size: int, mamba_size: int, state_dim: int = 3, replayssm: bool = False
+    ):
+        super().__init__(size=size, mamba_size=mamba_size, replayssm=replayssm)
+        self.mamba_pool = _CpuMambaPool(
+            mamba_size, state_dim=state_dim, replayssm=replayssm
+        )
+
+
+class _CpuVirtualSlotPool(_CpuStateCopyPool):
+    """A pool whose mamba ids are virtual: the physical one is offset.
+
+    `UnifiedHybridReqToTokenPool` hands out virtual ids; `copy_from` addresses
+    the state tensors physically, so the prune must translate both sides. The
+    offset makes "did it translate?" observable.
+    """
+
+    OFFSET = 100
+
+    def __init__(self, size: int, mamba_size: int):
+        super().__init__(size=size, mamba_size=mamba_size)
+        self.mamba_pool.size = mamba_size + self.OFFSET
+        self.mamba_pool.temporal = torch.zeros(
+            1, mamba_size + self.OFFSET + 1, self.mamba_pool.temporal.shape[2]
+        )
+
+    def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
+        return mamba_indices + self.OFFSET
+
+
+class TestStateCopyIsArmed(CustomTestCase):
+    """--enable-beam-mamba-state-copy: the prune copies state instead of
+    arming a read mapping, so nothing spans the tick."""
+
+    def setUp(self):
+        self.pool = _CpuStateCopyPool(size=8, mamba_size=8)
+        self.rows = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        self.owned = self.pool.alloc_mamba_for_rows(self.rows)
+        self.coord = _coordinator(self.pool, enable_beam_mamba_state_copy=True)
+
+    @staticmethod
+    def _seed(pool, slots):
+        """Give every slot a distinct state: slot s holds the value s."""
+        for s in slots.tolist():
+            pool.mamba_pool.temporal[:, s] = float(s)
+
+    @staticmethod
+    def _state(pool, slots):
+        return [float(pool.mamba_pool.temporal[0, s, 0]) for s in slots.tolist()]
+
+    def test_no_read_mapping_is_left_pending(self):
+        # The whole point: without a snapshot there is nothing for the backend
+        # to consume, nothing for the graph gates to trip on, and no stale
+        # mapping that could outlive its tick.
+        self.coord._apply_mamba_cow(self.rows, torch.tensor([1, 1, 0, 2]))
+
+        self.assertFalse(self.pool.beam_cow_read_mapping_pending())
+        self.assertIsNone(self.pool.get_beam_cow_read_mapping(self.rows))
+
+    def test_the_rows_move_to_fresh_slots(self):
+        self.coord._apply_mamba_cow(self.rows, torch.tensor([1, 1, 0, 2]))
+
+        new = self.pool.get_mamba_indices(self.rows)
+        self.assertEqual(new.tolist(), [5, 6, 7, 8])
+        # Fresh, hence disjoint from every source slot by construction.
+        self.assertEqual(set(new.tolist()) & set(self.owned.tolist()), set())
+
+    def test_the_new_slots_hold_the_parents_state(self):
+        # Not just the indices: the state itself has to have moved.
+        parent_idx = torch.tensor([1, 1, 0, 2], dtype=torch.int64)
+        self._seed(self.pool, self.owned)
+
+        self.coord._apply_mamba_cow(self.rows, parent_idx)
+
+        new = self.pool.get_mamba_indices(self.rows)
+        # Slot s was seeded with s, and row i's parent owned owned[parent_idx[i]].
+        self.assertEqual(
+            self._state(self.pool, new), self.owned[parent_idx].tolist()
+        )
+        # And the copy really ran, with src/dst the way the design says.
+        self.assertEqual(
+            self.pool.mamba_pool.calls,
+            [(self.owned[parent_idx].tolist(), new.tolist())],
+        )
+
+    def test_a_self_parented_row_copies_its_own_state(self):
+        # parent_idx[i] == i: the row keeps its own history, which is still a
+        # copy -- into a fresh slot, so src and dst stay disjoint.
+        parent_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        self._seed(self.pool, self.owned)
+
+        self.coord._apply_mamba_cow(self.rows, parent_idx)
+
+        new = self.pool.get_mamba_indices(self.rows)
+        self.assertEqual(self._state(self.pool, new), self.owned.tolist())
+        self.assertEqual(set(self.owned.tolist()) & set(new.tolist()), set())
+
+    def test_two_rows_swapping_parents(self):
+        # The case an in-place copy gets wrong: with dst drawn from the live
+        # slot set, row 0's dst IS row 1's src, so one of them loses. Allocating
+        # fresh slots first cannot alias.
+        parent_idx = torch.tensor([1, 0, 3, 2], dtype=torch.int64)
+        self._seed(self.pool, self.owned)
+
+        self.coord._apply_mamba_cow(self.rows, parent_idx)
+
+        new = self.pool.get_mamba_indices(self.rows)
+        self.assertEqual(
+            self._state(self.pool, new), self.owned[parent_idx].tolist()
+        )
+        self.assertEqual(
+            self._state(self.pool, new), [2.0, 1.0, 4.0, 3.0]
+        )
+
+    def test_the_copy_addresses_physical_slots(self):
+        # The table holds virtual ids; copy_from addresses the state tensors
+        # physically. On a unified pool those differ, so an untranslated call
+        # would copy garbage from an unrelated slot.
+        pool = _CpuVirtualSlotPool(size=8, mamba_size=8)
+        rows = torch.tensor([1, 2], dtype=torch.int64)
+        owned = pool.alloc_mamba_for_rows(rows)
+        coord = _coordinator(pool, enable_beam_mamba_state_copy=True)
+        parent_idx = torch.tensor([1, 0], dtype=torch.int64)
+
+        coord._apply_mamba_cow(rows, parent_idx)
+
+        new = pool.get_mamba_indices(rows)
+        self.assertEqual(
+            pool.mamba_pool.calls,
+            [
+                (
+                    [int(owned[1]) + pool.OFFSET, int(owned[0]) + pool.OFFSET],
+                    [int(new[0]) + pool.OFFSET, int(new[1]) + pool.OFFSET],
+                )
+            ],
+        )
+
+    def test_the_state_copy_wins_when_both_switches_are_on(self):
+        # Documented precedence: the true copy holds no state across a tick, so
+        # it is the safer of the two when a user sets both.
+        coord = _coordinator(
+            self.pool,
+            enable_beam_mamba_double_buffer=True,
+            enable_beam_mamba_state_copy=True,
+        )
+
+        coord._apply_mamba_cow(self.rows, torch.tensor([1, 1, 0, 2]))
+
+        self.assertFalse(self.pool.beam_cow_read_mapping_pending())
+        self.assertEqual(len(self.pool.mamba_pool.calls), 1)
+
+    def test_a_graph_replay_is_allowed_after_the_prune(self):
+        # Unlike the COW path, whose pending mapping makes the backend refuse a
+        # DECODE replay: nothing is pending, so the gate is open.
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            MambaAttnBackendBase,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        self.coord._apply_mamba_cow(self.rows, torch.tensor([1, 1, 0, 2]))
+        backend = MambaAttnBackendBase.__new__(MambaAttnBackendBase)
+        backend.req_to_token_pool = self.pool
+
+        self.assertIsNone(backend._assert_no_beam_cow_for_graph(ForwardMode.DECODE))
+
+    def test_a_non_hybrid_pool_is_a_no_op(self):
+        coord = _coordinator(object(), enable_beam_mamba_state_copy=True)
+
+        self.assertIsNone(
+            coord._apply_mamba_cow(self.rows, torch.tensor([0, 0, 0, 0]))
+        )
+
+    def test_no_rows_does_nothing(self):
+        empty = torch.zeros(0, dtype=torch.int64)
+
+        self.coord._apply_mamba_cow(empty, empty)
+
+        self.assertEqual(self.pool.mamba_pool.calls, [])
+        self.assertEqual(self.pool.mamba_allocator.available_size(), 4)
+
+
+class TestStateCopyRefusesWhatItCannotDo(CustomTestCase):
+    """Both guards fire before anything moves, so a refused prune leaves the
+    group exactly as it was."""
+
+    def setUp(self):
+        self.rows = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        self.parent_idx = torch.tensor([1, 1, 0, 2], dtype=torch.int64)
+
+    def test_replayssm_is_refused(self):
+        pool = _CpuStateCopyPool(size=8, mamba_size=8, replayssm=True)
+        owned = pool.alloc_mamba_for_rows(self.rows)
+        coord = _coordinator(pool, enable_beam_mamba_state_copy=True)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            coord._apply_mamba_cow(self.rows, self.parent_idx)
+
+        # The reason has to be in the message: copy_from moves temporal only,
+        # so an active source's ring would be dropped silently.
+        self.assertIn("--enable-linear-replayssm", str(ctx.exception))
+
+    def test_replayssm_leaves_the_rows_untouched(self):
+        pool = _CpuStateCopyPool(size=8, mamba_size=8, replayssm=True)
+        owned = pool.alloc_mamba_for_rows(self.rows)
+        coord = _coordinator(pool, enable_beam_mamba_state_copy=True)
+
+        with self.assertRaises(RuntimeError):
+            coord._apply_mamba_cow(self.rows, self.parent_idx)
+
+        self.assertEqual(pool.get_mamba_indices(self.rows).tolist(), owned.tolist())
+        self.assertFalse(pool.beam_cow_read_mapping_pending())
+        self.assertEqual(pool.mamba_pool.calls, [])
+        self.assertEqual(pool.mamba_allocator.available_size(), 4)
+
+    def test_a_short_allocator_raises(self):
+        # Same as the COW path: 4 rows, only 1 slot left.
+        pool = _CpuStateCopyPool(size=8, mamba_size=5)
+        pool.alloc_mamba_for_rows(self.rows)
+        coord = _coordinator(pool, enable_beam_mamba_state_copy=True)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            coord._apply_mamba_cow(self.rows, self.parent_idx)
+
+        self.assertIn("--enable-beam-mamba-state-copy", str(ctx.exception))
+
+    def test_a_short_allocator_leaves_the_rows_untouched(self):
+        pool = _CpuStateCopyPool(size=8, mamba_size=5)
+        pool.alloc_mamba_for_rows(self.rows)
+        coord = _coordinator(pool, enable_beam_mamba_state_copy=True)
+
+        with self.assertRaises(RuntimeError):
+            coord._apply_mamba_cow(self.rows, self.parent_idx)
+
+        self.assertEqual(pool.get_mamba_indices(self.rows).tolist(), [1, 2, 3, 4])
+        self.assertFalse(pool.beam_cow_read_mapping_pending())
+        self.assertEqual(pool.mamba_pool.calls, [])
+        self.assertEqual(pool.mamba_allocator.available_size(), 1)
+
+
+class TestStateCopyFreesTheOldSlotsOneTickLate(CustomTestCase):
+    """copy_from only enqueues on the stream: the detached slots still need the
+    deferred release, exactly as on the COW path."""
+
+    def setUp(self):
+        self.pool = _CpuStateCopyPool(size=8, mamba_size=8)
+        self.rows = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        self.owned = self.pool.alloc_mamba_for_rows(self.rows)
+        self.coord = _coordinator(self.pool, enable_beam_mamba_state_copy=True)
+        self.parent_idx = torch.tensor([1, 1, 0, 2], dtype=torch.int64)
+
+    def test_the_detached_slots_do_not_return_in_the_pruning_tick(self):
+        self.coord._apply_mamba_cow(self.rows, self.parent_idx)
+
+        self.assertEqual(self.pool.mamba_allocator.available_size(), 0)
+        self.assertNotIn(1, self.pool.mamba_allocator.free_slots.tolist())
+
+    def test_the_relay_hook_returns_them_on_the_next_forward(self):
+        self.coord._apply_mamba_cow(self.rows, self.parent_idx)
+
+        self.coord.maybe_select_and_relay(None, None)
+
+        self.assertEqual(self.pool.mamba_allocator.available_size(), 4)
+        self.assertEqual(
+            sorted(self.pool.mamba_allocator.free_slots.tolist()), [1, 2, 3, 4]
+        )
+        # The rows keep the slots the state was copied into.
+        self.assertEqual(self.pool.get_mamba_indices(self.rows).tolist(), [5, 6, 7, 8])
+
+    def test_every_slot_is_back_after_a_prune_cycle(self):
+        self.coord._apply_mamba_cow(self.rows, self.parent_idx)
+        self.coord.maybe_select_and_relay(None, None)
+
+        self.pool.free_mamba_for_rows(self.rows)
+
+        self.assertEqual(self.pool.mamba_allocator.available_size(), 8)
 
 
 if __name__ == "__main__":

@@ -203,6 +203,27 @@ class ExecKernel(msgspec.Struct):
             "mamba cache unless this is set.",
         ),
     ] = False
+    enable_beam_mamba_state_copy: A[
+        bool,
+        Arg(
+            help="Alternative to --enable-beam-mamba-double-buffer for beam "
+            "search on mamba / hybrid-linear-attention caches: instead of "
+            "splitting read from write for one tick, every prune performs a "
+            "full SSM state copy (MambaPool.copy_from) from the parent slot "
+            "into a freshly allocated slot for each beam row. Slower -- one "
+            "state-sized copy per row per prune, on the critical path -- but "
+            "it leaves no state spanning a tick boundary and takes no snapshot, "
+            "so it does not depend on the kernels accepting a separate "
+            "src_mamba_cache_indices: KDA, Mamba2 and the non-packed GDN decode "
+            "paths work too, and the cuda-graph gates stay open. Intended as a "
+            "correctness baseline and a bisection tool: if beam output differs "
+            "between this and the double buffer, the bug is in the copy-on-write "
+            "read side. Incompatible with ReplaySSM "
+            "(--enable-linear-replayssm / --enable-linear-replayssm-spec): the "
+            "copy moves temporal state but not the ring. Takes precedence when "
+            "both switches are set.",
+        ),
+    ] = False
     fp8_gemm_runner_backend: A[
         str,
         Arg(

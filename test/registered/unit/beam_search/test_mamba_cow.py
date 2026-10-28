@@ -25,7 +25,7 @@ class TestReadMapping(CustomTestCase):
     def test_absent_until_set(self):
         # A tick that never prunes must read and write the same slot, which the
         # backend expresses by falling back to the pool's own mapping.
-        self.assertIsNone(self.cow.read_mapping_for(torch.tensor([0, 1])))
+        self.assertIsNone(self.cow.read_mapping_for(torch.tensor([0, 1]), self.base))
 
     def test_set_then_read_returns_source_slots(self):
         rows = torch.tensor([2, 3], dtype=torch.int64)
@@ -34,25 +34,44 @@ class TestReadMapping(CustomTestCase):
         self.cow.set_read_mapping(self.base, rows, src)
 
         # The pruned rows read their parent's slot...
-        got = self.cow.read_mapping_for(rows)
+        got = self.cow.read_mapping_for(rows, self.base)
         self.assertTrue(torch.equal(got, src))
-        # ...and every other row still reads its own.
+        # ...and every other row still reads its own (from the live table).
         untouched = torch.tensor([0, 1, 4, 5], dtype=torch.int64)
         self.assertTrue(
-            torch.equal(self.cow.read_mapping_for(untouched), self.base[untouched])
+            torch.equal(self.cow.read_mapping_for(untouched, self.base), self.base[untouched])
         )
 
     def test_read_mapping_is_one_shot(self):
         rows = torch.tensor([0], dtype=torch.int64)
         self.cow.set_read_mapping(self.base, rows, torch.tensor([13], dtype=torch.int32))
-        self.assertIsNotNone(self.cow.read_mapping_for(rows))
+        self.assertIsNotNone(self.cow.read_mapping_for(rows, self.base))
 
         self.cow.clear_read_mapping()
 
         # The backend clears after consuming it. If the mapping survived into
         # the next forward, a tick that did not prune would read a stale parent
         # slot instead of the state it just wrote.
-        self.assertIsNone(self.cow.read_mapping_for(rows))
+        self.assertIsNone(self.cow.read_mapping_for(rows, self.base))
+
+    def test_rows_admitted_after_the_snapshot_read_live(self):
+        """A row that changed slot after the snapshot must not use it.
+
+        The snapshot copies the whole table mid-prune. Under concurrency a
+        request admitted later in the same tick gets a fresh slot, and serving
+        it from the snapshot would point it at the slot it held before -- some
+        other request's state. This showed up end to end as beams degenerating
+        into repeated tokens whenever several groups ran together.
+        """
+        pruned = torch.tensor([1], dtype=torch.int64)
+        self.cow.set_read_mapping(self.base, pruned, torch.tensor([10], dtype=torch.int32))
+
+        latecomer = torch.tensor([4], dtype=torch.int64)
+        self.base[latecomer] = 99  # admitted after the snapshot was taken
+
+        self.assertEqual(int(self.cow.read_mapping_for(latecomer, self.base)[0]), 99)
+        # the pruned row still reads its parent
+        self.assertEqual(int(self.cow.read_mapping_for(pruned, self.base)[0]), 10)
 
     def test_set_snapshots_the_base_mapping(self):
         rows = torch.tensor([2], dtype=torch.int64)
@@ -63,7 +82,7 @@ class TestReadMapping(CustomTestCase):
         # read mapping, or the kernel would read the slot it is about to write.
         self.base[rows] = 99
 
-        self.assertEqual(int(self.cow.read_mapping_for(rows)[0]), 10)
+        self.assertEqual(int(self.cow.read_mapping_for(rows, self.base)[0]), 10)
 
     def test_second_set_reuses_the_existing_snapshot(self):
         first = torch.tensor([1], dtype=torch.int64)
@@ -74,8 +93,8 @@ class TestReadMapping(CustomTestCase):
 
         # Two groups pruned in the same tick both land in one mapping, and the
         # second set must not re-snapshot a base that the first already moved.
-        self.assertEqual(int(self.cow.read_mapping_for(first)[0]), 10)
-        self.assertEqual(int(self.cow.read_mapping_for(second)[0]), 12)
+        self.assertEqual(int(self.cow.read_mapping_for(first, self.base)[0]), 10)
+        self.assertEqual(int(self.cow.read_mapping_for(second, self.base)[0]), 12)
 
 
 class TestSourceSlots(CustomTestCase):
@@ -125,7 +144,7 @@ class TestReset(CustomTestCase):
 
         cow.reset()
 
-        self.assertIsNone(cow.read_mapping_for(torch.tensor([0], dtype=torch.int64)))
+        self.assertIsNone(cow.read_mapping_for(torch.tensor([0], dtype=torch.int64), base))
         self.assertIsNone(cow.take_source_slots())
 
 

@@ -54,6 +54,7 @@ from sglang.srt.beam_search.fork import (
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.penalty_state import BeamPenaltyState
 from sglang.srt.beam_search.trie import BeamTrie
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -86,12 +87,19 @@ def _rows_topk_logprobs(
     pieces: Sequence[torch.Tensor],
     num_candidates: int,
     mask: Optional[torch.Tensor] = None,
+    penalty_state: Optional["BeamPenaltyState"] = None,
 ):
     """Top-`num_candidates` log-probs per row, over the concatenated pieces.
 
     `mask` (True = forbidden) is given in concatenated row order, i.e. aligned
     with `torch.cat(pieces)`; empty pieces contribute no rows, so they must not
     advance the row cursor.
+
+    `penalty_state` (None at the no-op defaults) applies the group's
+    frequency / presence / repetition penalties to RAW logits, before the
+    logsumexp, over each piece's own rows -- see penalty_state.py for the exact
+    order and for why the prompt is not counted. It is handed the piece's row
+    offset instead of a concatenated tensor so every piece keeps its own lse.
     """
     # One logsumexp per piece: it is not batch-invariant on CUDA, and folding
     # pieces shifts the leader's lse by an ulp, flipping near-equal beams.
@@ -101,6 +109,9 @@ def _rows_topk_logprobs(
         if piece.shape[0] == 0:
             continue
         x = piece.float()
+        if penalty_state is not None:
+            # Penalties before the lse, on this piece's rows only.
+            x = penalty_state.apply(x, row_start=row)
         # lse instead of a full [rows, vocab] log_softmax; topk order on raw
         # logits is identical under the monotone shift.
         lse = torch.logsumexp(x, dim=-1, keepdim=True)
@@ -139,6 +150,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     # req_to_token, so it needs the per-row copy-on-write double buffer that
     # this switch is the opt-in for.
     enable_beam_mamba_double_buffer: bool = False
+    # --enable-beam-mamba-state-copy. The opt-in for the other way to move SSM
+    # state across a prune: a real per-row state copy instead of the one-tick
+    # read/write split. Either one is enough to admit a beam request on a mamba
+    # cache; when both are set the true copy wins, because it holds no state
+    # across a tick boundary and asks nothing of the kernels.
+    enable_beam_mamba_state_copy: bool = False
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
@@ -179,13 +196,23 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # token slots, and the beam's reparent rewrites req_to_token in
             # place, so a survivor would silently lose the window it inherited.
             return "Beam search is not supported with SWA hybrid caches."
-        if self.tree_cache.supports_mamba() and not self.enable_beam_mamba_double_buffer:
+        # Either mamba path is an acceptable opt-in. `supports_mamba` is only a
+        # proxy for "this cache carries SSM state" -- ChunkCache does not
+        # override it, so a --disable-radix-cache hybrid run reaches here with
+        # it False while the prune below still has to move state. The real
+        # dispatch therefore lives in _apply_mamba_cow, on the pool.
+        if self.tree_cache.supports_mamba() and not (
+            self.enable_beam_mamba_double_buffer or self.enable_beam_mamba_state_copy
+        ):
             return (
                 "Beam search is not supported with mamba hybrid caches unless "
-                "--enable-beam-mamba-double-buffer is set: a beam prune cannot "
+                "--enable-beam-mamba-double-buffer or "
+                "--enable-beam-mamba-state-copy is set: a beam prune cannot "
                 "reparent SSM state by rewriting req_to_token the way it "
-                "reparents attention KV, so each pruned row has to read its "
-                "parent's slot while writing a freshly allocated one."
+                "reparents attention KV, so each pruned row has to be given its "
+                "parent's state -- either by reading the parent's slot while "
+                "writing a freshly allocated one (double buffer), or by copying "
+                "that state outright (state copy)."
             )
 
         if req.session_id is not None or recv_req.session_params is not None:
@@ -259,7 +286,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             max_new_tokens=max_new_tokens,
             num_return=user_params.n,
             length_penalty=user_params.length_penalty,
+            # Already normalized by SamplingParams to one of
+            # "off" | "false" | "true" | "never" (booleans from older callers
+            # are mapped there: True -> "true", False -> "off"), so the group
+            # never has to guess. "off" -- the default -- means decode to
+            # max_new_tokens.
             early_stopping=user_params.early_stopping,
+            # Read off the USER's params, so they must be taken before the
+            # leader's row params are neutralized below: from here on the
+            # leader's sampler only ever sees the neutral 0 / 0 / 1.
+            frequency_penalty=user_params.frequency_penalty,
+            presence_penalty=user_params.presence_penalty,
+            repetition_penalty=user_params.repetition_penalty,
             # Frontier state lives on device: selection consumes device top-2k
             # tensors in place; only k-sized results ever reach the host.
             device=self.req_to_token_pool.device,
@@ -386,6 +424,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # One leader row: its cursor is the whole mask. Built before
             # _select_group, which advances the cursor for the next tick.
             self._trie_mask(group),
+            # Counts are all zero at prefill, so this step is scored raw.
+            penalty_state=group.penalty_state,
         )
         final = group.next_step_is_final()
         next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
@@ -432,9 +472,22 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             [leader.kv.req_pool_idx], dtype=torch.int64, device=device
         )
         group.all_rows = torch.cat([leader_row, member_rows])
+        # Host mirror, same order as `all_rows` (leader first). It outlives the
+        # member rows: fork.free_member_rows nulls all_rows / member_rows_cpu on
+        # release, and the retire path still needs these numbers to withdraw the
+        # group from a mamba COW snapshot it armed but never consumed.
+        group.all_rows_cpu = [int(leader.kv.req_pool_idx), *rows]
         # Member rows are bare rows: alloc() never ran for them, so on a hybrid
         # pool their row -> mamba-slot entry is still 0 (the reserved padding
         # slot) and all k-1 members would read and write it. Own one slot each.
+        #
+        # Ownership alone is not enough: what a slot *holds* is whatever the
+        # allocator last issued it with (zeros on a fresh server, a stranger's
+        # state once slots recycle). A member is a fork of the leader at
+        # prompt_len, so its slot has to start from the state the leader's
+        # prefill just wrote -- otherwise its very first decode tick reads an
+        # SSM state that has never seen the prompt, and the beam decodes as if
+        # it started from a different prefix than it did.
         alloc_mamba = getattr(self.req_to_token_pool, "alloc_mamba_for_rows", None)
         if alloc_mamba is not None and alloc_mamba(member_rows) is None:
             # Hand the req rows back before failing. They are already out of
@@ -445,11 +498,24 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group.member_rows = None
             group.member_rows_cpu = None
             group.all_rows = None
+            # Nothing was ever armed under these rows, so the retire path must
+            # not try to withdraw them either.
+            group.all_rows_cpu = None
             raise AssertionError(
                 f"Beam member spawn needs {group.beam_width - 1} mamba slots but "
                 f"only {self.req_to_token_pool.mamba_allocator.available_size()} "
                 f"are free; raise --max-mamba-cache-size or lower beam_width."
             )
+        # Past the failure branch, so the members own their slots: inherit the
+        # leader's state into them. Unconditional on the COW / state-copy
+        # switch -- neither prune-time strategy can recover a state that was
+        # never inherited, and both are equally wrong without it. Runs on the
+        # same stream as the prefill that produced the state (the relay point),
+        # so the copy is ordered behind that write and ahead of the members'
+        # first decode.
+        fork_mamba = getattr(self.req_to_token_pool, "fork_mamba_from_row", None)
+        if fork_mamba is not None:
+            fork_mamba(leader.kv.req_pool_idx, member_rows)
 
     def select_and_relay_decode(
         self, batch: ScheduleBatch, logits_output: LogitsProcessorOutput
@@ -473,6 +539,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 # Row order matches pieces: leader first, then member rows in
                 # frontier order -- the same [k, ...] layout as trie_cursor.
                 self._trie_mask(group),
+                penalty_state=group.penalty_state,
             )
             next_tokens, parent_idx = self._select_group(
                 group, top_logprobs, top_tokens, batch.forward_iter
@@ -568,29 +635,40 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # SSM state rides the same reparenting: every row whose KV now
             # points at its parent's window must also decode from its parent's
             # recurrent state, or the two histories disagree from here on.
-            self._apply_mamba_cow(rows, parent_idx)
+            self._apply_mamba_cow(rows, parent_idx, group.all_rows_cpu)
             # Length placeholder only; the DAG owns history and member rows
             # have no host state.
             group.leader.output_ids.append(0)
         self._stash_next_tokens(rows, next_tokens)
 
-    def _apply_mamba_cow(self, rows: torch.Tensor, parent_idx: torch.Tensor) -> None:
-        """Write side of the mamba double buffer for one group's prune.
+    def _apply_mamba_cow(
+        self,
+        rows: torch.Tensor,
+        parent_idx: torch.Tensor,
+        rows_cpu: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Dispatch the mamba half of one group's prune.
+
+        `rows_cpu` is `rows` on the host (same order). Only the double buffer
+        needs it: it arms a snapshot that has to be withdrawn if this group ends
+        before a decode consumes it (see BeamMambaCow.forget_rows). The true
+        copy holds nothing across the tick, so it ignores it.
 
         Attention KV is reparented by the `remap_kv_mapping` call above; SSM
-        state cannot be, so each row instead reads its parent's slot for this
-        one forward while writing a slot of its own. That read-then-write *is*
-        the state copy, fused into the step that was going to write anyway.
+        state cannot be, so each pruned row has to be given its parent's state.
+        Two ways to do that, picked by --enable-beam-mamba-state-copy:
 
-        The three steps are order-critical and pure device work (no D2H):
+          - the copy-on-write double buffer (default): the row reads its
+            parent's slot for this one forward while writing a slot of its own,
+            so the copy is fused into the step that was going to write anyway;
+          - the true copy (_apply_mamba_state_copy): the state is copied
+            outright, here and now.
 
-          1. source slots = the parent rows' slots as they are right now;
-          2. `set_beam_cow_read_mapping`, which snapshots the live table --
-             it must run BEFORE step 3, or the snapshot would name the fresh
-             slots and every row would read the slot it is about to write;
-          3. `replace_mamba_for_rows`, which installs the fresh slots, and the
-             detached old ones are staged to go back one tick late (the kernel
-             is still reading them this forward).
+        The dispatch sits here rather than in the admission gate because that
+        gate asks `tree_cache.supports_mamba()`, which is only a proxy: a pool
+        that carries SSM state but reports False there (ChunkCache) still runs
+        this method. `replace_mamba_for_rows` is what actually says "this pool
+        has per-row SSM state".
 
         No-op on a pool without the mamba double buffer (a non-hybrid pool).
         """
@@ -602,21 +680,66 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if need == 0:
             return
         # Check before touching anything: a short allocator must not leave a
-        # half-installed read mapping behind. len() reads a shape, not data, so
-        # this stays off the sync path.
+        # half-installed read mapping / half-copied slot behind. len() reads a
+        # shape, not data, so this stays off the sync path. Both paths need
+        # `need` fresh slots, so both pay this check.
         if pool.mamba_allocator.available_size() < need:
             raise RuntimeError(
-                f"Beam prune needs {need} fresh mamba slots for the copy-on-write "
-                f"double buffer but only {pool.mamba_allocator.available_size()} "
+                f"Beam prune needs {need} fresh mamba slots for the mamba state "
+                f"handover but only {pool.mamba_allocator.available_size()} "
                 f"are free; raise --max-mamba-cache-size / "
-                f"--mamba-full-memory-ratio, lower beam_width, or disable "
-                f"--enable-beam-mamba-double-buffer."
+                f"--mamba-full-memory-ratio, lower beam_width, or switch "
+                f"--enable-beam-mamba-double-buffer / "
+                f"--enable-beam-mamba-state-copy off."
             )
+        if self.enable_beam_mamba_state_copy:
+            # Nothing above has moved any state, so a raise in here still
+            # leaves the group exactly as it was.
+            self._apply_mamba_state_copy(rows, parent_idx, replace)
+            return
+        self._apply_mamba_cow_double_buffer(rows, parent_idx, replace, need, rows_cpu)
+
+    def _apply_mamba_cow_double_buffer(
+        self,
+        rows: torch.Tensor,
+        parent_idx: torch.Tensor,
+        replace,
+        need: int,
+        rows_cpu: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Write side of the copy-on-write double buffer for one group's prune.
+
+        Each row reads its parent's slot for this one forward while writing a
+        slot of its own. That read-then-write *is* the state copy, fused into
+        the step that was going to write anyway.
+
+        The three steps are order-critical and pure device work (no D2H):
+
+          1. source slots = the parent rows' slots as they are right now;
+          2. `set_beam_cow_read_mapping`, which snapshots the live table --
+             it must run BEFORE step 3, or the snapshot would name the fresh
+             slots and every row would read the slot it is about to write;
+          3. `replace_mamba_for_rows`, which installs the fresh slots, and the
+             detached old ones are staged to go back one tick late (the kernel
+             is still reading them this forward).
+
+        The cost is a cross-tick contract: the mapping is a snapshot of the
+        whole row table that has to survive until the backend consumes it, and
+        only the GDN packed decode path knows how to read a source index at
+        all. That is the risk the true-copy path exists to price.
+
+        Part of that contract is `rows_cpu`: this group may end in the very
+        commit that follows, and then no decode ever consumes the mapping it
+        armed here. The retire path withdraws those rows (see
+        `_forget_beam_cow_rows`), so the next owner of the row numbers is not
+        sent reading slots that were detached and freed in the meantime.
+        """
+        pool = self.req_to_token_pool
         # `parent_idx` is in `rows` order (the same index space remap_kv_mapping
         # uses), so the parent's slot is the row's own table entry gathered at
         # the parent's position -- read before step 3 overwrites any of them.
         src_slots = pool.req_index_to_mamba_index_mapping[rows][parent_idx]
-        pool.set_beam_cow_read_mapping(rows, src_slots)
+        pool.set_beam_cow_read_mapping(rows, src_slots, rows_cpu=rows_cpu)
         previous = replace(rows)
         if previous is None:
             # Unreachable after the availability check above, but a silent None
@@ -627,6 +750,84 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"copy-on-write double buffer; raise --max-mamba-cache-size or "
                 f"lower beam_width."
             )
+        if previous.numel():
+            pool.stage_beam_cow_source_slots(previous)
+
+    def _apply_mamba_state_copy(
+        self,
+        rows: torch.Tensor,
+        parent_idx: torch.Tensor,
+        replace,
+    ) -> None:
+        """True-copy alternative to the double buffer for one group's prune.
+
+        Same shape as the COW path -- every pruned row ends up on a freshly
+        allocated slot holding its parent's state -- but the copy happens here,
+        in the prune, instead of being smuggled into the next forward's write:
+
+          1. source slots = the parent rows' slots as they are right now
+             (must be read before step 2 overwrites any of them);
+          2. `replace_mamba_for_rows` installs a fresh slot per row;
+          3. `MambaPool.copy_from` moves conv + temporal state parent -> fresh
+             slot. Both sides are translated virtual -> physical first: the
+             table holds virtual ids and copy_from addresses the state tensors.
+          4. no `set_beam_cow_read_mapping`, so nothing spans the tick: the
+             row reads and writes its own slot from here on.
+
+        Why it is safe where the COW path is not: because step 2 allocates, the
+        destinations are slots nobody owned a tick ago, hence disjoint from the
+        sources by construction. An in-place variant (src and dst drawn from the
+        same live slot set) would overlap for a self-parented row, and for two
+        rows swapping parents -- and `copy_from`'s fused branch asserts src/dst
+        disjoint, so those cases would be a corrupted copy rather than a loud
+        failure. Allocating first is what buys the disjointness for free.
+
+        What it costs: one state-sized copy per row per prune, on the critical
+        path, whereas the COW path's copy is folded into a write it was going to
+        do anyway. It is the slower path; it is here as a correctness baseline
+        and a bisection handle.
+
+        What it buys: no snapshot and no backend contract. `src_mamba_cache_indices`
+        stays None, so the cuda-graph gates stay open and the KDA / Mamba2 /
+        non-packed GDN decode paths -- which raise NotImplementedError on a
+        separate source index -- work unchanged.
+
+        The old slots still go back one tick late (step 4 reuses the existing
+        staging queue). `copy_from` only enqueues on the stream, so an immediate
+        free would let the allocator reissue a slot whose copy has not landed;
+        the deferred release is the same protection the COW path needs, and it
+        carries none of the defects the read mapping does.
+        """
+        pool = self.req_to_token_pool
+        mamba_pool = pool.mamba_pool
+        # Checked before anything moves: copy_from carries only `temporal`, not
+        # the ReplaySSM ring, and it resets the destination cursor to 0. A beam
+        # prune copies from an *active* decoding slot whose ring is non-empty,
+        # so those pending updates would be dropped silently and the state
+        # would disagree with the ring the next decode reads.
+        if mamba_pool.replayssm_write_pos is not None:
+            raise RuntimeError(
+                "Beam mamba state copy (--enable-beam-mamba-state-copy) is not "
+                "compatible with ReplaySSM: the copy moves temporal state but "
+                "not the ring, and a beam prune copies from an active decoding "
+                "slot, so its un-flushed ring entries would be dropped "
+                "silently. Disable --enable-linear-replayssm / "
+                "--enable-linear-replayssm-spec, or run with "
+                "--enable-beam-mamba-double-buffer instead."
+            )
+        src_slots = pool.req_index_to_mamba_index_mapping[rows][parent_idx]
+        previous = replace(rows)
+        if previous is None:
+            raise RuntimeError(
+                f"Beam prune could not allocate {int(rows.numel())} fresh mamba "
+                f"slots for the state copy; raise --max-mamba-cache-size or "
+                f"lower beam_width."
+            )
+        new_slots = pool.req_index_to_mamba_index_mapping[rows]
+        mamba_pool.copy_from(
+            pool.translate_mamba_indices(src_slots),
+            pool.translate_mamba_indices(new_slots),
+        )
         if previous.numel():
             pool.stage_beam_cow_source_slots(previous)
 
@@ -705,15 +906,62 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         free_member_rows(group, self.req_to_token_pool, self.token_to_kv_pool_allocator)
         self._reclaim_orphans(group)
 
+    def _forget_beam_cow_rows(self, group: BeamGroup) -> None:
+        """Withdraw this group's rows from an unconsumed mamba COW snapshot.
+
+        Called from `_retire_group` because that is the one place all three
+        exits converge -- `_finish_group`, `_abort_group`, and the retract-abort
+        path (`retire_group`) -- and it runs while the group is still the owner
+        of its rows.
+
+        Timing: on the finish and abort paths `fork.free_member_rows` has
+        already handed the member rows back to `free_slots` (it runs just
+        before), and on the retract path `retract_decode` freed them together
+        with the leader's row. That is still safe: everything between that free
+        and this call is straight-line, allocating-nothing code on the scheduler
+        thread, so no other request can have been issued these row numbers in
+        between. What matters is only that the withdrawal happens before the
+        scheduler next admits a request, which it does.
+
+        No-op when the group never armed a snapshot (no spawn, or a spawn that
+        rolled back) and on a non-hybrid pool, which has no such method.
+        """
+        # getattr, not an attribute: duck-typed group stand-ins (tests, and the
+        # retract path's partially released group) do not all carry the field.
+        rows_cpu = getattr(group, "all_rows_cpu", None)
+        if rows_cpu is None:
+            return
+        forget = getattr(self.req_to_token_pool, "forget_beam_cow_rows", None)
+        if forget is None:
+            return
+        rows = getattr(group, "all_rows", None)
+        if rows is None:
+            # The rows are already released; only the host copy survived, so
+            # rebuild the device index. Teardown path, not the hot one.
+            rows = torch.tensor(
+                rows_cpu, dtype=torch.int64, device=self.req_to_token_pool.device
+            )
+        forget(rows, rows_cpu)
+
     def _retire_group(self, group: BeamGroup) -> None:
         # Exactly once per group, so the O(1) live gate stays accurate.
         if not group.retired:
             # Staged orphans are referenced by no row, so the retract-abort
             # path's direct fork.free_member_rows cannot see them.
             self._reclaim_orphans(group)
+            # Before `retired = True`, i.e. while the group still owns its rows:
+            # a snapshot armed by this group's last prune would otherwise outlive
+            # it and serve the next owner of these rows freed parent slots.
+            self._forget_beam_cow_rows(group)
             group.retired = True
             # Drops overshoot selections staged after the terminal commit.
             group._pending_steps.clear()
+            # Drop the group's penalty state: it holds a [k, vocab] count table
+            # that nothing reads once the group is gone. Only the reference goes
+            # away -- no zeroing kernel is enqueued, so this never touches a
+            # stream the device may still be running on, and the allocator's own
+            # stream bookkeeping is what makes the block reusable afterwards.
+            group.penalty_state = None
             self._num_live_groups -= 1
 
     def _stash_next_tokens(self, rows, tokens) -> None:

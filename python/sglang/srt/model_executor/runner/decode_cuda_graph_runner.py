@@ -682,6 +682,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # hybrid backend additionally raises if a mapping ever reaches a replay.
         if getattr(forward_batch, "beam_num_tail_rows", 0):
             return False
+        # beam_width=1 prunes too: it has no member rows, so the check above
+        # sees nothing, but the leader row is still handed a fresh slot and a
+        # read mapping. Ask the pool directly -- that covers every group shape.
+        pending = getattr(self.model_runner.req_to_token_pool,
+                          "beam_cow_read_mapping_pending", None)
+        if pending is not None and pending():
+            return False
 
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)

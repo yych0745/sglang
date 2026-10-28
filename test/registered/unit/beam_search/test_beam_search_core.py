@@ -248,13 +248,17 @@ class TestBeamGroup(CustomTestCase):
         self.assertAlmostEqual(results[1].beam_score, -0.12, places=5)
 
     def test_insufficient_survivors_finishes_group(self):
-        group = self._make_group(stop_token_ids=[5, 6, 7])
+        # early_stopping is opt-in now (the default is "off"), so name the mode
+        # this step relies on: one survivor remains, but three beams already
+        # finished, and "true" stops on a full pool rather than waiting for the
+        # budget. The survivor is dropped, not folded in.
+        group = self._make_group(stop_token_ids=[5, 6, 7], early_stopping="true")
         sel = run_select(
             [0.0], [[-0.1, -0.2, -0.3, -0.4]], [[5, 6, 7, 8]], {5, 6, 7}, 2
         )
         self.assertTrue(group.advance(sel))
         results = group.finalize()
-        # Pool: three stop-finished beams + the folded-in partial survivor.
+        # Pool: the three stop-finished beams only.
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].tokens, [5])
         self.assertAlmostEqual(results[0].beam_score, -0.1, places=5)
@@ -471,22 +475,29 @@ class TestEarlyStoppingWiring(CustomTestCase):
     ``send_beam_official.py --no-early-stopping`` against a live server.
     """
 
-    def test_default_is_on(self):
-        self.assertIs(SamplingParams().early_stopping, True)
+    def test_default_is_off(self):
+        # BREAKING CHANGE: the default used to be True (== "true"), i.e. beam
+        # search stopped as soon as the completed pool filled. It is now "off":
+        # a request runs to max_new_tokens unless it opts in.
+        self.assertEqual(SamplingParams().early_stopping, "off")
 
-    def test_none_normalizes_to_on(self):
+    def test_none_normalizes_to_the_default(self):
         # Non-optional field: an explicit null must fall back to the default.
-        self.assertIs(SamplingParams(early_stopping=None).early_stopping, True)
+        self.assertEqual(SamplingParams(early_stopping=None).early_stopping, "off")
 
     def test_explicit_values_survive_normalization(self):
-        self.assertIs(SamplingParams(early_stopping=True).early_stopping, True)
-        self.assertIs(SamplingParams(early_stopping=False).early_stopping, False)
+        # Booleans are the historical wire form and are mapped to modes...
+        self.assertEqual(SamplingParams(early_stopping=True).early_stopping, "true")
+        self.assertEqual(SamplingParams(early_stopping=False).early_stopping, "off")
+        # ...and the four modes pass through unchanged.
+        for mode in ("off", "false", "true", "never"):
+            self.assertEqual(SamplingParams(early_stopping=mode).early_stopping, mode)
 
     def test_decodes_from_a_request_dict(self):
         # /generate hands these over positionally (SamplingParams is
         # array_like), so decode a full-length array with our slots set.
         params = decode_sampling_params(beam_width=3, early_stopping=False)
-        self.assertIs(params.early_stopping, False)
+        self.assertEqual(params.early_stopping, "off")
         self.assertEqual(params.beam_width, 3)
 
     def _group_ready_to_stop(self, early_stopping: bool) -> BeamGroup:
